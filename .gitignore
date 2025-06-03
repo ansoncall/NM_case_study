@@ -1,0 +1,7 @@
+processed_data/*
+raw_data/*
+figures/*
+
+.Rproj.user
+*.csv
+*.png
