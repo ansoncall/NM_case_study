@@ -1,4 +1,5 @@
-## this script works through the burn severity, topography, and climate data to transform and load the data and do any initial clipping that is required. 
+## this script works through the burn severity, topography, and climate data to
+## transform and load the data and do any initial clipping that is required.
 
 ############## Load packages
 
@@ -12,126 +13,138 @@ library(mapview)
 
 ################ Load data
 
-# Fire perimiters
-bounds<-read_sf("raw_data/fire_perimiters/Perimeters.shp") 
+# load CBI data
+cbi <- raster("./raw_data/burn_severity/ravg_2022_cbi4.tif")
+# save spatial reference for use with other data
+proj <- crs(cbi)
 
-# subset the hermits peak and calf canyon fires
-hpcc <- subset(bounds, bounds$poly_Incid %in% c("Calf Canyon","Hermits Peak"))
-ggplot(hpcc)+geom_sf()
-hpcc<-st_make_valid(hpcc)
+# load fire perimeters
+hpcc <- read_sf("raw_data/fire_perimeters/Perimeters.shp") %>% 
+  # subset to HPCC fires
+  subset(.$poly_Incid %in% c("Calf Canyon","Hermits Peak")) %>% 
+  # ensure valid geometries
+  st_make_valid %>% 
+  # reproject
+  st_transform(crs = proj)
 
-# open the vegetation treatment data
-veg_treatments<-read_sf("./raw_data/NMVeg.gdb")
-veg_treatments<-st_make_valid(veg_treatments)
+# load vegetation treatment data
+veg_treatments <- read_sf("./raw_data/NMVeg.gdb") %>% 
+  # ensure valid geometries
+  st_make_valid %>% 
+  # reproject
+  st_transform(crs = proj) %>% 
+  # intersect with the burn perimeter to remove treatments outside the burn scar
+  # st_intersection(hpcc) %>% # not needed, see below 
+  # remove treatments with centroids that are not in the burn scar Nate: you
+  # only need to run the intersection once - if the treatment centroid isn't in
+  # the burn scar, the full polygon won't intersect either.
+  st_intersection(st_centroid(.), hpcc)
 
-# open CBI data, this is what I reference all other coordinate reference systems too
-CBI<-raster("./raw_data/burn_severity/ravg_2022_cbi4.tif")
+# crop CBI data to ROI
+cbi_crop <- crop(cbi, hpcc)
 
-#transform the boundaries for HPCC boundaries
-hpcc_projected<-st_transform(hpcc,crs(CBI))
+# write out projected perimeter data
+write_sf(hpcc, dsn="./processed_data/burn_perimeter.shp")
+# write out cropped CBI raster
+writeRaster(cbi, 
+            filename="./processed_data/clipped_burn_raster.tif",
+            overwrite=TRUE)
+# write out cropped vegetation treatment data
+st_write(veg_treatments, 
+         dsn="./processed_data/vegetation_treatments_hpcc_new.shp",
+         append=FALSE)
 
-write_sf(hpcc_projected,dsn="./processed_data/burn_perimiter.shp")
-
-CBI<-crop(CBI,hpcc_projected)
-raster::writeRaster(CBI,filename="./processed_data/clipped_burn_raster.tif",overwrite=TRUE)
-
-veg_treatments<-st_transform(veg_treatments,crs(CBI))
-
-##########################
-
-# crop the NM vegetation treatment database to the burn scar
-veg_treatments_cropped<-st_intersection(veg_treatments,hpcc_projected)
-
-
-centroids_in_scar<-st_intersection(st_centroid(veg_treatments),hpcc_projected)
-
-veg_treatments_cropped<-veg_treatments[veg_treatments$GlobalID %in% centroids_in_scar$GlobalID,]
-
-mapview(hpcc_projected)+mapview(veg_treatments_cropped)
-
-st_write(veg_treatments_cropped,dsn="./processed_data/vegetation_treatments_hpcc_new.shp",append=FALSE)
-#veg_treatments_cropped_2<-st_transform(veg_treatments_cropped,crs=4269)
-
-ycell<-CBI@nrows
-xcell<-CBI@ncols
-bounds<-st_bbox(CBI)
 ######################### Raster of Vegetation Treatments with a 10m buffer
+# define raster dimensions
+ycell<-cbi@nrows
+xcell<-cbi@ncols
+bounds<-st_bbox(cbi)
+
 # confirm measurements are in meters
-st_crs(veg_treatments_cropped)$units
+st_crs(veg_treatments)$units
 
-veg_treatments_buffer<-st_buffer(veg_treatments_cropped,10)
+# buffer the vegetation treatments by 10m
+veg_treatments_buffer <- st_buffer(veg_treatments_cropped, 10)
 
-empty_raster<-raster(nrows=ycell,ncols=xcell,xmn=bounds[1],xmx=bounds[3],ymn=bounds[2],ymx=bounds[4],crs=st_crs(veg_treatments_buffer))
+# TODO not sure this is all that necessary, could just use cbi raster to
+# define dimensions
+empty_raster <- raster(nrows = ycell, ncols = xcell, xmn = bounds[1], 
+                       xmx = bounds[3], ymn = bounds[2], ymx = bounds[4], 
+                       crs = st_crs(veg_treatments_buffer))
 
-rast_veg_full<-raster::rasterize(veg_treatments_buffer,empty_raster)
-
-plot(rast_veg_full)
+rast_veg_full <- rasterize(veg_treatments_buffer, empty_raster)
 
 ## using this as a mask requires that the areas we want to remove (the treatments) be NA values
-
+# create mask by defining raster with NA values for treatment areas
 rast_veg_full[is.na(rast_veg_full[])] <- (-1) 
 rast_veg_full[rast_veg_full[]>0]<-NA
 
 plot(rast_veg_full)
 
-#####################
-
-masked_cbi<-raster::mask(CBI,rast_veg_full)
+masked_cbi<-raster::mask(cbi,rast_veg_full)
 
 plot(masked_cbi)
 
 ## save the masked raster for model training
-writeRaster(masked_cbi,"./processed_data/masked_raster.tif",overwrite=TRUE)
+writeRaster(masked_cbi, "./processed_data/masked_raster.tif", overwrite=TRUE)
 
 
 
 ###################### Roads ################################ 
 
+# level 0 road segments
+roads_0 <- st_read("./raw_data/transportation/Trans_RoadSegment_0.shp") %>% 
+  st_transform(crs = proj) %>% 
+  st_crop(bounds)
 
-roads1<-st_read("./raw_data/transportation/Trans_RoadSegment_0.shp")
-roads1<-st_transform(roads1,st_crs(veg_treatments_cropped))
-roads1_cropped<-st_crop(roads1,st_bbox(CBI))
+# level 1 road segments
+roads_1 <- st_read("./raw_data/transportation/Trans_RoadSegment_1.shp") %>% 
+  st_transform(crs = proj) %>% 
+  st_crop(bounds)
 
-
-roads2<-st_read("./raw_data/transportation/Trans_RoadSegment_1.shp")
-roads2<-st_transform(roads2,st_crs(veg_treatments_cropped))
-roads2_cropped<-st_crop(roads2,st_bbox(CBI))
-
-rm(roads1,roads2)
-roads<-rbind(roads1_cropped,roads2_cropped)
-roads_buffer<-st_buffer(roads,10)## 10 meter buffer around roads
-
-st_write(roads,"./processed_data/burn_scar_roads.shp",append=TRUE) ### looks OK. has some forest service roads but not every single one.
-
-#roads_raster<-st_rasterize(roads%>% dplyr::select(geometry), nx = 700, ny = 700)
-
-roads_raster<-raster::rasterize(roads,empty_raster)
-
-plot(roads_raster)
-
-## making a raster of distance to road
-
-roads_raster_distance<-terra::distance(roads_raster)
-
-plot(roads_raster_distance)
+# combine road segments
+roads <- rbind(roads_0, roads_1) %>% 
+  # buffer by 10m
+  # Nate: previously, you had created a buffered roads layer, but exported the
+  # non-buffered one. Is this correct? If you're not using the buffered roads,
+  # do you need to create the buffer in the first place?
+  st_buffer()
 
 
-writeRaster(roads_raster_distance,"./processed_data/distance_to_road.tif",overwrite=TRUE)
+# Note, this looks ok. has some forest service roads but not every single one.
+st_write(roads, "./processed_data/burn_scar_roads.shp", append=TRUE) 
+
+# distance to road raster
+roads_raster_distance <-raster::rasterize(roads, empty_raster) %>% 
+  terra::distance
+
+writeRaster(roads_raster_distance, 
+            "./processed_data/distance_to_road.tif", 
+            overwrite=TRUE)
 
 
 ################# Topographic data
 
-elev<-raster("./raw_data/HPCC_elevations.tif")
+elev <- raster("./raw_data/HPCC_elevations.tif")
+# todo should be terra::terrain?
+slopes <- terrain(elev, "slope") %>% resample()
+aspect <- terrain(elev, "aspect")
+TRI <- terrain(elev, "TRI")
+TPI <- terrain(elev, "TPI")
 
-slopes<-terrain(elev,v="slope")
-aspect<-terrain(elev,"aspect")
-TRI<-terrain(elev,"TRI")
-TPI<-terrain(elev,"TPI")
 
+# define function to aggregate and reproject topographic rasters to match CBI
+transform_raster <- function(from_raster, to_raster = cbi) {
+  # define aggregation factors
+  fact <- c(round(from_raster@nrows/to_raster@nrows), 
+            round(from_raster@ncols/to_raster@nrows))
+  # aggregate raster
+  transformed <- terra::aggregate(from_raster, fact = fact, fun = "mean") %>% 
+    # reproject to target CRS
+    projectRaster(crs=st_crs(to_raster))
+  return(transformed)
+}
 
-### figuring out how much to aggregate these data
-xfact<-round(elev@nrows/xcell)
-yfact<-round(elev@ncols/ycell)
 
 
 
@@ -167,15 +180,15 @@ rm(elev,slopes,aspect,TRI,TPI)
 lf_site_potential<-raster("./raw_data/landfire_environmental_site_potential/Tif/us_140esp.tif")
 plot(lf_site_potential)
 
-#projected_cbi<-projectRaster(CBI_raster,crs=crs(lf_site_potential))                         
+#projected_cbi<-projectRaster(cbi_raster,crs=crs(lf_site_potential))                         
 
 
 #plot(lf_site_potential_cropped)
 
 ## this takes a very long time to run
-lf_site_potential_projected<-projectRaster(lf_site_potential,crs=crs(CBI),method="ngb")
+lf_site_potential_projected<-projectRaster(lf_site_potential,crs=crs(cbi),method="ngb")
 
-lf_site_potential_cropped<-crop(lf_site_potential_projected,CBI)
+lf_site_potential_cropped<-crop(lf_site_potential_projected,cbi)
 
 plot(lf_site_potential_cropped)
 
@@ -194,13 +207,13 @@ rm(lf_site_potential,lf_site_potential_cropped)
 #### climate variables
 
 tmin<-raster("./raw_data/prism_climate/PRISM_tmin_30yr_normal_800mM5_annual_asc.asc")
-tmin<-projectRaster(tmin,CBI)
+tmin<-projectRaster(tmin,cbi)
 
 vpdmax<-raster("./raw_data/prism_climate/PRISM_vpdmax_30yr_normal_800mM5_annual_asc.asc")
-vpdmax<-projectRaster(vpdmax,CBI)
+vpdmax<-projectRaster(vpdmax,cbi)
 
 ppt<-raster("./raw_data/prism_climate/PRISM_ppt_30yr_normal_800mM4_annual_asc.asc")
-ppt<-projectRaster(ppt,CBI)
+ppt<-projectRaster(ppt,cbi)
 
 writeRaster(tmin,"./processed_data/tmin.tif")
 writeRaster(vpdmax,"./processed_data/vpdmax.tif")
