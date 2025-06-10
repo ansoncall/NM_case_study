@@ -14,7 +14,9 @@ library(forcats)
 library(caret)
 # load data
 
-# validation plots are the randomly selected plots that the different methods will be evalauted across. It contains both the validation plots and the practitioner generated controls
+# validation plots are the randomly selected plots that the different methods
+# will be evalauted across. It contains both the validation plots and the
+# practitioner generated controls
 validation_plots<-read_sf("./processed_data/val_points_revised.shp",fid_column_name="ID")
 
 # pairing is the information about how to match the practitioner generated controls
@@ -35,7 +37,7 @@ CBI[CBI==0]<-1
 plot_method_cbi<-as.data.frame(raster::extract(CBI,st_as_sf(validation_plots),fun=mean,na.rm=FALSE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE))
 
 plot_method_cbi<-data.frame(FID=validation_plots$ID,cbi=plot_method_cbi$V1)
-
+# Nate: double check that the subsetting is correct here. 
 validation_cbi<-plot_method_cbi[plot_method_cbi$FID>352,]
 
 
@@ -57,40 +59,105 @@ plot(compare_df$control_plot_cbi,compare_df$origional_plot_cbi)
 
 origional_plots<-validation_plots[validation_plots$ID %in% compare_df$plot_id,]
 
-############# Simple perimiters
-size_of_perimiter<-sqrt((33*4046.86)/pi)-sqrt((10*4046.86)/pi)
+############# Simple perimiters 
 
-perimiters<-st_buffer(origional_plots,size_of_perimiter,allow_holes=TRUE)
+# "We also used an alternative method that defines the post hoc control as a
+# simple 4-hectare buffer around the validation plot, which we call the “buffer
+# method” (Vorster et al. 2023). As with the other methods, a 60-m wide buffer
+# around the validation plot was removed to minimize edge effects, and a
+# 4-hectare area around the excluded area was summarized to estimate the
+# counterfactual burn severity (Figure S2). 
+ 
+# Nate: I'm not following along 100% since I'm just reading the code, not
+# running it. That said, it looks like you are taking a
+
+
+# the correct math(?):
+# original plot radius (in meters)
+og_plot_radius = sqrt(10*4046.86/pi)
+# add 60 m buffer
+inner_ring = og_plot_radius + 60
+# need to know area of original plot + buffer
+inner_ring_area = pi*inner_ring^2
+inner_ring_area/4046.86 
+# okay, supplement S2 shows a 10 acre buffer area, but the text says 4 ha buffer
+# area. I'll do the math for both. 
+
+# now calculate the desired outer ring area (inner ring area + ac)
+# (choose one)
+total_area = inner_ring_area + 40000 # 40,000 m2 == 4 hectares 
+# total_area = inner_ring_area + (10*4046.86) # 40,000 m2 == 4 hectares
+# now calculate the outer ring radius
+outer_ring_radius = sqrt(total_area/pi)
+# check final area
+outer_ring_area = pi*outer_ring_radius^2
+final_area = outer_ring_area - inner_ring_area # checks out
+
+# I think this is just leftover from double checking?
+size_of_perimiter<-sqrt((33*4046.86)/pi)-sqrt((10*4046.86)/pi) # not sure where 33 comes from? possibly og 10 acres + 60 m buffer area + new 10 acres?
+perimiters<-st_buffer(origional_plots,size_of_perimiter,allow_holes=TRUE) # what is allow_holes doing?
 st_area(perimiters)/4046.86
 og_plots<-st_buffer(origional_plots,60)
 st_area(og_plots)/4046.86
+
+
+test_outer_ring_area = pi*size_of_perimiter^2
+
+
 
 perimiter_extract<-raster::extract(masked_cbi,st_as_sf(perimiters),na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
 origional_extract<-raster::extract(masked_cbi,st_as_sf(og_plots),na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
 
 compare_df$buffer_method<-NA
 
+# another place to refactor. Can use terra::extract and parallelize. 
 for (i in 1:nrow(compare_df)){
   one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
   
-  area_of_plot<-st_area(one_plot)/4046.86
+  area_of_plot<-st_area(one_plot)/4046.86 # dividing by 4046, so I assume the units are m2 and you want acres. This should be ==10.
   
-  buffer_plot<-st_buffer(one_plot,60)
-  area_of_plot_with_buffer<-st_area(buffer_plot)/4046.86
+  buffer_plot<-st_buffer(one_plot,60) # adding 60m buffer, adding 60m to the radius, buffer plot is now ~94565 m2 or ~23.36 acres in area. 
+  area_of_plot_with_buffer<-st_area(buffer_plot)/4046.86 # should be ~23.36 acres. 
+  # it looks like size_of_perimeter is the buffer size. to calc this, you want
+  # to take the ~23 acre buffer_plot, add 10 acres in area, then take the radius
+  # of that area, then subtract the original radius. That would give you the
+  # correct parameter for the next st_buffer(). 
   
-  size_of_perimiter<-sqrt(((area_of_plot+area_of_plot_with_buffer)*4046.86)/pi)-sqrt((area_of_plot)*4046.86/pi)
+  # you have: 
+  # radius( (area(ogplot) + area(ogplot_w60mbuff)) ) - radius( area(ogplot) )
+  # looks correct!
+  size_of_perimiter<-sqrt(((area_of_plot+area_of_plot_with_buffer)*4046.86)/pi)-sqrt((area_of_plot)*4046.86/pi) 
   
-  perimiters<-st_buffer(one_plot,size_of_perimiter,allow_holes=TRUE)
-  area_perimiter<-st_area(perimiters)/4046.86
-  
-  perimiter_extract<-raster::extract(masked_cbi,st_as_sf(perimiters),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
+  perimiters<-st_buffer(one_plot,size_of_perimiter,allow_holes=TRUE) # what is allow_holes doing here?
+  area_perimiter<-st_area(perimiters)/4046.86 # should be ~33 acres, unless allow_holes is doing something funky.
+  # the following looks to be returning a 1-element vector with CBI mean of the
+  # 33 acre plot, not the 10 acre perimeter plot. should leave fun=NULL to
+  # return a list of all raster values within the geometry. weights and
+  # normalizeWeights just make mean() return an area-weighted pixel
+  # mean--addresses edge pixels--but afaik doesn't change the output type.
+  perimiter_extract<-raster::extract(masked_cbi,st_as_sf(perimiters),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE) 
   origional_extract<-raster::extract(masked_cbi,st_as_sf(buffer_plot),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-  
-  perimiter_only<-as.numeric(((perimiter_extract[1]*area_perimiter)-(origional_extract[1]*area_of_plot_with_buffer))/(area_perimiter-area_of_plot_with_buffer))
+  # You can't recover the perimeter-plot-only mean CBI this way. 
+  perimiter_only<-as.numeric(((perimiter_extract[1]*area_perimiter)-(origional_extract[1]*area_of_plot_with_buffer))/(area_perimiter-area_of_plot_with_buffer)) 
 
   compare_df[compare_df$plot_id==one_plot$FID_1,"buffer_method"]<-perimiter_only
   
 }
+
+# imagine the og plot is all 2's and the perimeter plot is all 9's. This matrix
+# isn't scaled to the right dimensions, but that doesn't matter for this
+# example. Here, the perimeter plot area ==8 and the og plot area ==1.
+
+test_all <- matrix(c(9, 9, 9, 
+                     9, 2, 9, 
+                     9, 9, 9), 
+                   nrow = 3)
+# we know the mean of the perimeter plot should be 9. If you take the mean of the whole enchilada, you get ~8.22.
+mean_all <- mean(test_all, na.rm=TRUE)
+# doesn't matter if you have the plot areas correct, you can't get back to 9 with this kind of math. 
+((mean_all * 8) - (2 * 1)) / (8 - 1) 
+sum_all <- sum(test_all, na.rm=TRUE)
+((sum_all * 8) - (2 * 1)) / (8 - 1) 
 
 sqrt(mean((compare_df$origional_plot_cbi-compare_df$buffer_method)**2,na.rm=TRUE))
 

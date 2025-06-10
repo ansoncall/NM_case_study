@@ -10,7 +10,7 @@ library(mapview)
 
 
 ##### Download the weather data from gridmet
-
+# Nate: I skipped the downloads bc the files were already downloaded. 
 downloader::download(
   url = "http://www.northwestknowledge.net/metdata/data/rmax_2022.nc",
   destfile = "raw_data/rmax_2022.nc",
@@ -107,7 +107,7 @@ weather_raster$xy<-paste(weather_raster$x,weather_raster$y,sep="_")
 
 ## looping through the burn days and extracting the weather data for the appropriate cells. 
 for (i in 2:length(dates)){
-
+  # Nate: if I were to refactor something, maybe I'd start here?
   fm100<-projectRaster(raster("./raw_data/fm100_2022.nc",as.numeric(format(dates_converted[i],"%j"))),to=CBI)
   fm1000<-projectRaster(raster("./raw_data/fm1000_2022.nc",as.numeric(format(dates_converted[i],"%j"))),to=CBI)
   vs<-projectRaster(raster("./raw_data/vs_2022.nc",as.numeric(format(dates_converted[i],"%j"))),to=CBI)
@@ -191,7 +191,7 @@ fm1000<-raster("./processed_data/fm1000.tif")
 masked_cbi<-raster("./processed_data/masked_raster.tif")
 masked_cbi[masked_cbi==9]<-NA
 masked_cbi[masked_cbi==0]<-1
-
+# Nate: terra::extract is supposed to be faster. Maybe a good place to use mclapply as well. 
 gridded_plots$elevation<-raster::extract(elev_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
 gridded_plots$aspect<-raster::extract(aspect_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
 gridded_plots$tri<-raster::extract(TRI_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)

@@ -64,8 +64,12 @@ filled_r <- t_days
 na_cells <- which(is.na(values(t_days)))
 all_coords <- crds(t_days,na.rm=FALSE)
 
-remaining_na_cells<-na_cells[na_cells>i]
-  
+# i not defined, replaced i with 0
+remaining_na_cells<-na_cells[na_cells>0]
+
+
+# Nate: this loop runs, but is slow. I didn't wait for it to finish. The outputs
+# look okay.
 for (i in remaining_na_cells) {
   target_coord <- all_coords[i, , drop = FALSE]
   
@@ -90,9 +94,9 @@ for (i in remaining_na_cells) {
 mapview(filled_r)
 
 raster::writeRaster(filled_r,filename="./processed_data/julian_day_of_burn.tiff",overwrite=TRUE)
-
+# filled_r <- raster("./processed_data/julian_day_of_burn.tiff")
 raster::writeRaster(mask(filled_r,burn_perimiter),filename="./processed_data/julian_day_of_burn_masked.tiff",overwrite=TRUE)
 
 mapview(burn_perimiter)+mapview(mask(filled_r,burn_perimiter))
-
+# mapview(filled_r)
 
