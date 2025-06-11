@@ -1,33 +1,39 @@
-## this script works through the burn severity, topography, and climate data to
-## transform and load the data and do any initial clipping that is required.
+# this script reads in or downloads raw data, clips, buffers, resamples, and
+# reprojects as needed, then writes out tidy .shp or .tif files.
 
-############## Load packages
+# set new_dl == TRUE if you wish to download new data (where available).
+# otherwise, it will read in existing data from the ./raw_data/ directory.
 
-library(ggplot2)
-library(dplyr)
+# load packages ####
+library(tidyverse)
 library(sf)
-library(raster)
-library(stars)
 library(elevatr)
-library(mapview)
+library(terra)
+library(purrr)
 
-################ Load data
+# set options ####
+# boost terra memory usage and display progress bar by default
+terra::terraOptions(memfrac = 0.8, progress = 1)
 
-# load CBI data
-cbi <- raster("./raw_data/burn_severity/ravg_2022_cbi4.tif")
+# load data ####
+## CBI (composite burn index) ####
+cbi_full_extent <- rast("./raw_data/burn_severity/ravg_2022_cbi4.tif")
 # save spatial reference for use with other data
-proj <- crs(cbi)
+proj <- crs(cbi_full_extent) # EPSG9822 NAD83 CONUS Albers, unit: meters
 
-# load fire perimeters
-hpcc <- read_sf("./raw_data/fire_perimeters/Perimeters.shp") %>% 
+## fire perimeters ####
+hpcc <- read_sf("./raw_data/fire_perimeters/Perimeters.shp") %>%
   # subset to HPCC fires
-  subset(.$poly_Incid %in% c("Calf Canyon","Hermits Peak")) %>% 
+  subset(.$poly_Incid %in% c("Calf Canyon", "Hermits Peak")) %>%
   # ensure valid geometries
-  st_make_valid %>% 
+  st_make_valid %>%
   # reproject
   st_transform(crs = proj)
 
-# load vegetation treatment data
+# now that we have polygons, use them to clip the cbi raster
+cbi <- crop(cbi_fullextent, hpcc)
+
+## vegetation treatments ####
 veg_treatments <- read_sf("./raw_data/NMVeg.gdb") %>%
   # ensure valid geometries
   st_make_valid %>%
@@ -36,199 +42,151 @@ veg_treatments <- read_sf("./raw_data/NMVeg.gdb") %>%
   # subset by ROI. treatment centroid must be within HPCC burn boundary.
   filter(apply(st_intersects(st_centroid(.), hpcc, sparse = FALSE), 1, any))
 
-# crop CBI data to ROI
-cbi_crop <- crop(cbi, hpcc)
-
-# write out projected perimeter data
-write_sf(hpcc, dsn="./processed_data/burn_perimeter.shp")
-# write out cropped CBI raster
-writeRaster(cbi, 
-            filename="./processed_data/clipped_burn_raster.tif",
-            overwrite=TRUE)
-# write out cropped vegetation treatment data
-st_write(veg_treatments, 
-         dsn="./processed_data/vegetation_treatments_hpcc_new.shp",
-         append=FALSE)
-
-######################### Raster of Vegetation Treatments with a 10m buffer
-# define raster dimensions
-ycell<-cbi_crop@nrows
-xcell<-cbi_crop@ncols
-bounds<-st_bbox(cbi_crop)
-
-# confirm measurements are in meters
-if (st_crs(veg_treatments)$units != "m") {
-  stop("Vegetation treatments are not in meters\n. 
-       Please reproject to a CRS with meters as units.")
-} else {
-  message("Vegetation treatments are in meters.")
-}
-
 # buffer the vegetation treatments by 10m
-veg_treatments_buffer <- st_buffer(veg_treatments, 10) %>% 
-  st_union %>% 
-  st_sf
+veg_rast <- st_buffer(veg_treatments, 10) %>%
+  # rasterize, using the CBI raster as a template
+  rasterize(cbi)
 
-# TODO not sure this is all that necessary, could just use cbi raster to
-# define dimensions
-empty_raster <- raster(nrows = ycell, ncols = xcell, xmn = bounds[1], 
-                       xmx = bounds[3], ymn = bounds[2], ymx = bounds[4], 
-                       crs = st_crs(veg_treatments_buffer))
+# use veg_rast to create masked CBI raster
+# set inverse = TRUE to mask out the vegetation treatment areas *if* you didn't
+# already invert the veg_rast raster
+masked_cbi <- terra::mask(cbi, veg_rast, inverse = TRUE)
 
-library(fasterize)
-rast_veg_full <- fasterize(veg_treatments_buffer, cbi_crop)
-
-plot(rast_veg_full)
-mapview(rast_veg_full)
-## using this as a mask requires that the areas we want to remove (the treatments) be NA values
-# create mask by defining raster with NA values for treatment areas
-rast_veg_full[is.na(rast_veg_full[])] <- (-1) 
-rast_veg_full[rast_veg_full[]>0]<-NA
-
-terra::terraOptions(memfrac = 0.8, progress = 1)
-# slow
-masked_cbi <- terra::mask(cbi_crop, veg_treatments_buffer, inverse = TRUE)
-
-plot(masked_cbi)
-
-## save the masked raster for model training
-writeRaster(masked_cbi, "./processed_data/masked_raster.tif", overwrite=TRUE)
-
-
-
-###################### Roads ################################ 
-# list shapefiles to read
-roadlist <- c("./raw_data/transportation/Trans_RoadSegment_0.shp", 
-              "./raw_data/transportation/Trans_RoadSegment_1.shp")
-roads <- lapply(roadlist, st_read) %>% 
+## roads ####
+# read in road segments, combine, reproject, and crop to HPCC bounds
+roads <- lapply(c("./raw_data/transportation/Trans_RoadSegment_0.shp",
+                  "./raw_data/transportation/Trans_RoadSegment_1.shp"),
+                st_read) %>%
   # combine road segments
-  do.call(rbind, .) %>% 
+  do.call(rbind, .) %>%
   # reproject to match CBI
-  st_transform(crs = proj) %>% 
+  st_transform(crs = proj) %>%
   # ensure valid geometries
-  st_make_valid %>% 
+  st_make_valid %>%
   # crop to bounds of CBI raster
-  st_crop(bounds) 
-
-  # buffer by 10m
-  # Nate: previously, you had created a buffered roads layer, but exported the
-  # non-buffered one. Is this correct? If you're not using the buffered roads,
-  # do you need to create the buffer in the first place?
-  # st_buffer()
-
-
-# Nate: the RoadSegment_0 shapefile did not download correctly, so I could not
-# test this. It looks okay though. 
-st_write(roads, "./processed_data/burn_scar_roads.shp", append=TRUE) 
+  st_crop(st_bbox(cbi))
 
 # distance to road raster
-roads_raster_distance <-raster::rasterize(roads, empty_raster) %>% 
-  terra::distance
+roads_distance_rast <- rasterize(roads, cbi) %>%
+  distance
 
-writeRaster(roads_raster_distance, 
-            "./processed_data/distance_to_road.tif", 
-            overwrite=TRUE)
-
-
-################# Topographic data
-# Nate: could not download this one either. I just took the 3DEP 1/3 arc  second
-# DEM, I assume that's what you started with
-elev_0 <- raster("./raw_data/USGS_13_n36w106_20250311.tif")
-elev_1 <- raster("./raw_data/USGS_13_n37w106_20250311.tif")
-# combine the two DEMs
-elev <- merge(elev_0, elev_1) 
-mapview(elev)
-
-# todo should be terra::terrain?
-slopes <- terrain(elev, "slope")
-aspect <- terrain(elev, "aspect")
-TRI <- terrain(elev, "TRI")
-TPI <- terrain(elev, "TPI")
-
-
-# define function to aggregate and reproject topographic rasters to match CBI
-transform_raster <- function(from_raster, to_raster = cbi) {
-  # define aggregation factors
-  facts <- list(round(from_raster@nrows/to_raster@nrows), 
-            round(from_raster@ncols/to_raster@nrows))
-  # aggregate raster
-  transformed <- terra::aggregate(from_raster, fact = facts, fun = "mean") %>% 
-    # reproject to target CRS
-    projectRaster(crs=st_crs(to_raster))
-  return(transformed)
+## topography ####
+# can download from source
+new_dl <- FALSE # set to TRUE to download new elevation data
+if (new_dl == TRUE) {
+  # Nate: not sure if this is the exact same call you used originally. z = 13
+  # (~13.5 m resolution) might be excessive, z = 12 is about 27m resolution at
+  # 45*N latitude. Isn't the cbi raster at 30m resolution? I'm wondering if
+  # there was a reason to aggregate and reproject *after* calculating the
+  # terrain metrics? Why not just get the DEM in the right projection and then
+  # run the calculations on that, instead of aggregating and reprojecting 4
+  # times? PS get_elev_raster is pulling the projection from the CBI raster to
+  # define the extent here, but it doesn't resample to match resolutions unless
+  # you explicitly call project() on the result
+  elev <- get_elev_raster(locations = cbi, z = 13) %>%
+    # convert RasterLayer to SpatRaster
+    rast %>%
+    # project to match CBI.
+    project(cbi)
+} else {
+  elev <- rast("./raw_data/HPCC_elevations.tif") %>%
+    project(cbi)
 }
 
-yfact <- round(elev@nrows/cbi@nrows)
-xfact <- round(elev@ncols/cbi@ncols)
+# calculate terrain metrics
+terrain_vars <- c("slope", "aspect", "TRI", "TPI")
+terrain_metrics <- terrain(elev, terrain_vars)
 
-####### manipulate elevation data to calculate aspect, topogr
-elev_down<-terra::aggregate(elev,fact=c(yfact,xfact),fun="mean")
-elev_down <- transform_raster(elev, cbi)
-aspect_down<-terra::aggregate(aspect,fact=c(yfact,xfact),fun="mean")
-TRI_down<-terra::aggregate(TRI,fact=c(yfact,xfact),fun="mean")
-TPI_down<-terra::aggregate(TPI,fact=c(yfact,xfact),fun="mean")
-slope_down<-terra::aggregate(slopes,fact=c(yfact,xfact),fun="mean")
+## environmental site potential ####
+# Nate: do we want to write in an option to download this like we did for the
+# DEM? Could use
+# https://cran.r-project.org/web//packages//rlandfire/vignettes/rlandfire.html
+lf_site_potential <-
+  rast("./raw_data/landfire_environmental_site_potential/Tif/us_140esp.tif") %>%
+  project(cbi, method = "near")
 
-### transform everything to correct CRS
-#crs(masked_cbi)<-CRS('+init=EPSG:4269')
+# Nate: terra default behavior seems to be a little different than raster, at
+# least regarding plots of categorical rasters. I'm not sure how this might
+# affect downstream analyses, but it's worth double-checking. It seems that the
+# category we want is the "VALUE_1" category, which seems to be the most
+# fine-grained categorization. See below:
+# check the categories
+cats(lf_site_potential)[[1]][1:10, ]
+# set active category
+activeCat(lf_site_potential) <- "VALUE_1"
+# plot. colors can be changed with coltab(), but it's complicated. the current
+# coltab is based on the RGB categories and only shows a unique color for each
+# ESP2 category.
+plot(lf_site_potential, main = "VALUE_1")
+# some other options.
+activeCat(lf_site_potential) <- "ESP_LF"
+plot(lf_site_potential, main = "ESP_LF")
+activeCat(lf_site_potential) <- "ESPLF_NAME"
+plot(lf_site_potential, main = "ESPLF_NAME")
 
-elev_down<-projectRaster(elev_down,masked_cbi)
-aspect_down<-projectRaster(aspect_down,masked_cbi)
-TRI_down<-projectRaster(TRI_down,masked_cbi)
-TPI_down<-projectRaster(TPI_down,masked_cbi)
-slope_down<-projectRaster(slope_down,masked_cbi)
+## climate ####
+clim_vars <- c("tmin", "vpdmax", "ppt")
+for (i in seq_along(clim_vars)) {
+  # read in each climate variable. note: ppt remains in version M4, others at
+  # version M5. this is why the filename changes between vars.
+  if (i < 3) {
+    clim_var <- rast(paste0("./raw_data/prism_climate/PRISM_", clim_vars[i],
+                            "_30yr_normal_800mM5_annual_asc.asc")) %>%
+      # project to match CBI
+      project(cbi)
+  } else {
+    clim_var <- rast(paste0("./raw_data/prism_climate/PRISM_", clim_vars[i],
+                            "_30yr_normal_800mM4_annual_asc.asc")) %>%
+      project(cbi)
+  }
+  # assign to global environment
+  assign(clim_vars[i], clim_var)
+}
 
+# Write out ####
+## CBI ####
+# cropped CBI raster
+writeRaster(cbi,
+            filename = "./processed_data/clipped_burn_raster.tif",
+            overwrite = TRUE)
+# cropped and masked CBI raster
+writeRaster(masked_cbi, "./processed_data/masked_raster.tif", overwrite = TRUE)
 
-writeRaster(elev_down,"./processed_data/elev_down.tif",overwrite=TRUE)
-writeRaster(aspect_down,"./processed_data/aspect_down.tif",overwrite=TRUE)
-writeRaster(TRI_down,"./processed_data/TRI_down.tif",overwrite=TRUE)
-writeRaster(TPI_down,"./processed_data/TPI_down.tif",overwrite=TRUE)
-writeRaster(slope_down,"./processed_data/slope_down_degrees.tif",overwrite=TRUE)
+## fire perimeters ####
+write_sf(hpcc, dsn = "./processed_data/burn_perimeter.shp")
 
-rm(elev,slopes,aspect,TRI,TPI)
+## vegetation treatments ####
+st_write(veg_treatments,
+         dsn = "./processed_data/vegetation_treatments_hpcc_new.shp",
+         append = FALSE)
 
-################## Environmental site potential 
-#crs(masked_cbi)<-CRS('+init=EPSG:4269')
+## roads ####
+# cropped and reprojected road segments
+st_write(roads, "./processed_data/burn_scar_roads.shp", append = TRUE)
+# distance to road raster
+writeRaster(roads_distance_rast,
+            "./processed_data/distance_to_road.tif",
+            overwrite = TRUE)
 
+## topography ####
+# elevation
+writeRaster(elev, "./processed_data/elev_down.tif", overwrite = TRUE)
+map(terrain_vars, function(x) {
+  # write each terrain metric to a file
+  writeRaster(terrain_metrics[[x]],
+              filename = paste0("./processed_data/", x, "_down.tif"),
+              overwrite = TRUE)
+})
 
-lf_site_potential<-raster("./raw_data/landfire_environmental_site_potential/Tif/us_140esp.tif")
-plot(lf_site_potential)
+## environmental site potential ####
+writeRaster(lf_site_potential,
+            "./processed_data/lf_site_potential_new.tif",
+            overwrite = TRUE)
 
-#projected_cbi<-projectRaster(cbi_raster,crs=crs(lf_site_potential))                         
-
-
-#plot(lf_site_potential_cropped)
-
-## this takes a very long time to run
-lf_site_potential_projected<-projectRaster(lf_site_potential,crs=crs(cbi),method="ngb")
-
-lf_site_potential_cropped<-crop(lf_site_potential_projected,cbi)
-
-plot(lf_site_potential_cropped)
-
-lf_site_potential_cropped@data<-as.factor(lf_site_potential_cropped)
-
-is.factor(lf_site_potential_cropped)
-
-lf_site_potential_cropped_down<-terra::resample(lf_site_potential_cropped,elev_down,method="ngb") ## ngb is nearest neighbor
-
-
-
-writeRaster(lf_site_potential_cropped_down,"./processed_data/lf_site_potential_new.tif",overwrite=TRUE)
-
-rm(lf_site_potential,lf_site_potential_cropped)
-
-#### climate variables
-
-tmin<-raster("./raw_data/prism_climate/PRISM_tmin_30yr_normal_800mM5_annual_asc.asc")
-tmin<-projectRaster(tmin,cbi)
-
-vpdmax<-raster("./raw_data/prism_climate/PRISM_vpdmax_30yr_normal_800mM5_annual_asc.asc")
-vpdmax<-projectRaster(vpdmax,cbi)
-
-ppt<-raster("./raw_data/prism_climate/PRISM_ppt_30yr_normal_800mM4_annual_asc.asc")
-ppt<-projectRaster(ppt,cbi)
-
-writeRaster(tmin,"./processed_data/tmin.tif")
-writeRaster(vpdmax,"./processed_data/vpdmax.tif")
-writeRaster(ppt,"./processed_data/ppt.tif")
+## climate ####
+map(clim_vars, function(x) {
+  # write each climate variable to a file
+  writeRaster(get(x),
+              filename = paste0("./processed_data/", x, ".tif"),
+              overwrite = TRUE)
+})
