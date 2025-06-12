@@ -1,102 +1,69 @@
-###### this code follows the methods described in Parks 2014 Mapping day-of-burning with coarse-resolution satellite fire-detection data.
-######
+# this script follows the methods described in Parks 2014 Mapping day-of-burning
+# with coarse-resolution satellite fire detection data.
+
+# load packages ####
+library(tidyverse)
 library(sf)
-library(raster)
-library(lubridate)
-library(mapview)
 library(terra)
 library(FNN)
-library(terra)
+library(conflicted)
+# set options ####
 
-########
+# load data ####
+# HPCC burn perimeter
+burn_perimeter <- read_sf("./processed_data/burn_perimeter.shp")
 
+# composite burn index (CBI) raster
+cbi <- rast("./processed_data/clipped_burn_raster.tif")
 
-d<-read_sf("./raw_data/satelite_fire_detection/fire_archive_M-C61_605340.shp")
+#  fire detections
+d <- read_sf(
+  "./raw_data/satelite_fire_detection/fire_archive_M-C61_605340.shp"
+) %>%
+  st_transform(st_crs(burn_perimeter)) %>%
+  st_crop(burn_perimeter) %>%
+  mutate(ACQ_DATE = ymd(ACQ_DATE), jdate = as.numeric(format(ACQ_DATE, "%j")))
 
-mapview(d)
+# make interpolated raster ####
+## precompute coords and distance matrix ####
+# create sparse DOB raster, using CBI raster as a template
+dob <- rasterize(d, cbi, field = "jdate")
+# coords of each cell
+coords <- xyFromCell(dob, 1:ncell(dob))
+# coords of all NA cells (no hotspot detected)
+na_coords <- coords[is.na(values(dob)), ]
+# coords of all non-NA cells
+detection_coords <- coords[!is.na(values(dob)), ]
+# values of all non-NA cells (julian day of earliest hotspot detection)
+dob_values <- values(dob)[!is.na(values(dob))]
+# build KNN index
+knn_result <- get.knnx(detection_coords, na_coords, k = 5)
 
-## trim data to burn scar and transform
-
-burn_perimiter<-read_sf("./processed_data/burn_perimiter.shp")
-
-d<-st_transform(d,st_crs(burn_perimiter))
-
-d<-st_crop(d,burn_perimiter)
-
-d$ACQ_DATE<-ymd(d$ACQ_DATE)
-
-d$jdate<-as.numeric(format(d$ACQ_DATE,"%j"))
-
-## Empty raster
-CBI<-raster("./processed_data/clipped_burn_raster.tif")
-CBI[CBI==9]<-NA
-CBI[CBI==0]<-1
-
-
-ycell<-CBI@nrows
-xcell<-CBI@ncols
-bounds<-st_bbox(CBI)
-
-empty_raster<-raster(nrows=ycell,ncols=xcell,xmn=bounds[1],xmx=bounds[3],ymn=bounds[2],ymx=bounds[4],crs=st_crs(CBI)$wkt)
-
-##
-
-days_raster<-raster::rasterize(d,empty_raster,field="jdate")
-
-##########
-
-t_days<-rast(days_raster)
-
-
-d_raster<-distance(t_days)
-
-####################
-coords<-crds(t_days,na.rm=TRUE)
-jday_vals <- values(t_days)[!is.na(values(t_days))]
-d_vals <- values(d_raster)[!is.na(values(t_days))]
-
-knn_model <- get.knnx(coords, coords, k = 5)
-
-
-filled_r <- t_days
-
-# Loop through NA cells and compute weighted value
-na_cells <- which(is.na(values(t_days)))
-all_coords <- crds(t_days,na.rm=FALSE)
-
-# i not defined, replaced i with 0
-remaining_na_cells<-na_cells[na_cells>0]
-
-
-# Nate: this loop runs, but is slow. I didn't wait for it to finish. The outputs
-# look okay.
-for (i in remaining_na_cells) {
-  target_coord <- all_coords[i, , drop = FALSE]
-  
-  # Find 5 nearest non-NA neighbors
-  nn <- get.knnx(coords, target_coord, k = 5)
-  idx <- nn$nn.index[1, ]
-  
-  nn.coords<-all_coords[idx,]
-  
-  d_i<-distance(target_coord,nn.coords)
-  
-  jdays <- jday_vals[idx]
-  d_i <- values(d_raster)[i]  # Use distance value from d raster
-  
-  if (!is.na(d_i)) {
-    mean_jday <- mean(jdays)
-    w_i <- (1 / (abs(jdays - mean_jday) + 1)) * d_i
-    values(filled_r)[i] <- round(sum((w_i*jdays))/sum(w_i),0)
-  }
+## define interpolation function ####
+weighted_dob <- function(target_idx) {
+  # use the indices to pull the distances of the nearest neighbors
+  nn_dist <- knn_result[[2]][target_idx, ]
+  # use the indices to pull the values of the nearest neighbors
+  days_of_burn <- dob_values[knn_result[[1]][target_idx, ]]
+  # calculate "weights" following Parks 2014.
+  w_i <- (1 / (abs(days_of_burn - mean(days_of_burn)) + 1)) * nn_dist
+  # use weights to calculate the interpolated value.
+  # Nate: fyi style guide says to use implicit returns
+  round(sum((w_i * days_of_burn)) / sum(w_i), 0)
 }
 
-mapview(filled_r)
+## map function over all NA cells ####
+# Nate: this works, but we could code-golf it further with purrr::modify_if().
+# I'm not very familiar with the modify() family, so I'm going to stop here.
+dob[is.na(values(dob))] <- map(seq_len(nrow(na_coords)),
+                               \(x) weighted_dob(x)) %>%
+  unlist
 
-raster::writeRaster(filled_r,filename="./processed_data/julian_day_of_burn.tiff",overwrite=TRUE)
-# filled_r <- raster("./processed_data/julian_day_of_burn.tiff")
-raster::writeRaster(mask(filled_r,burn_perimiter),filename="./processed_data/julian_day_of_burn_masked.tiff",overwrite=TRUE)
+## mask result ####
+dob_masked <- mask(dob, burn_perimeter)
 
-mapview(burn_perimiter)+mapview(mask(filled_r,burn_perimiter))
-# mapview(filled_r)
-
+plot(dob_masked, main = "Ordinal date of burn")
+# write out ####
+writeRaster(dob_masked,
+            filename = "./processed_data/julian_day_of_burn.tiff",
+            overwrite = TRUE)

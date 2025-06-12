@@ -9,7 +9,6 @@ library(tidyverse)
 library(sf)
 library(elevatr)
 library(terra)
-library(purrr)
 
 # set options ####
 # boost terra memory usage and display progress bar by default
@@ -74,16 +73,7 @@ roads_distance_rast <- rasterize(roads, cbi) %>%
 # can download from source
 new_dl <- FALSE # set to TRUE to download new elevation data
 if (new_dl == TRUE) {
-  # Nate: not sure if this is the exact same call you used originally. z = 13
-  # (~13.5 m resolution) might be excessive, z = 12 is about 27m resolution at
-  # 45*N latitude. Isn't the cbi raster at 30m resolution? I'm wondering if
-  # there was a reason to aggregate and reproject *after* calculating the
-  # terrain metrics? Why not just get the DEM in the right projection and then
-  # run the calculations on that, instead of aggregating and reprojecting 4
-  # times? PS get_elev_raster is pulling the projection from the CBI raster to
-  # define the extent here, but it doesn't resample to match resolutions unless
-  # you explicitly call project() on the result
-  elev <- get_elev_raster(locations = cbi, z = 13) %>%
+  elev <- get_elev_raster(locations = cbi, z = 12) %>%
     # convert RasterLayer to SpatRaster
     rast %>%
     # project to match CBI.
@@ -105,24 +95,7 @@ lf_site_potential <-
   rast("./raw_data/landfire_environmental_site_potential/Tif/us_140esp.tif") %>%
   project(cbi, method = "near")
 
-# Nate: terra default behavior seems to be a little different than raster, at
-# least regarding plots of categorical rasters. I'm not sure how this might
-# affect downstream analyses, but it's worth double-checking. It seems that the
-# category we want is the "VALUE_1" category, which seems to be the most
-# fine-grained categorization. See below:
-# check the categories
-cats(lf_site_potential)[[1]][1:10, ]
-# set active category
-activeCat(lf_site_potential) <- "VALUE_1"
-# plot. colors can be changed with coltab(), but it's complicated. the current
-# coltab is based on the RGB categories and only shows a unique color for each
-# ESP2 category.
-plot(lf_site_potential, main = "VALUE_1")
-# some other options.
-activeCat(lf_site_potential) <- "ESP_LF"
-plot(lf_site_potential, main = "ESP_LF")
-activeCat(lf_site_potential) <- "ESPLF_NAME"
-plot(lf_site_potential, main = "ESPLF_NAME")
+# TODO check downstream code to make sure factor levels are correct
 
 ## climate ####
 clim_vars <- c("tmin", "vpdmax", "ppt")
