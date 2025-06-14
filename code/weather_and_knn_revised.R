@@ -1,160 +1,119 @@
-############## Load packages
+# this script prepares weather data and identifies candidate control plots for
+# the burn severity analysis. it (optionally) downloads gridmet data, processes
+# it, and extracts relevant features for each day of the burn. It also creates a
+# grid of control plots based on the burn perimeter and extracts environmental
+# features for these plots.
 
-library(ggplot2)
-library(dplyr)
+# load packages ####
+library(tidyverse)
+library(downloader)
 library(sf)
-library(raster)
-library(stars)
-library(elevatr)
-library(mapview)
+library(terra)
+library(conflicted)
+# set options ####
+# boost terra memory usage and never display progress bar
+terraOptions(memfrac = 0.8, progress = 0)
 
+# load data ####
+## composite burn index (CBI) ####
+# Nate: you were using the full cbi raster (covering all of north america) here?
+cbi <- rast("./processed_data/clipped_burn_raster.tif") %>%
+  # 9 is the code for "unmappable". set to NA for downstream analysis.
+  subst(9, NA) %>%
+  # 0 == outside the fire perimeter and 1 == inside, but unburned. here, we
+  # consider these to be the same.
+  subst(0, 1)
+plot(cbi)
 
-##### Download the weather data from gridmet
-# Nate: I skipped the downloads bc the files were already downloaded. 
-downloader::download(
-  url = "http://www.northwestknowledge.net/metdata/data/rmax_2022.nc",
-  destfile = "raw_data/rmax_2022.nc",
-  mode = 'wb'
-)
+## day of burn (DOB) ####
+dob <- rast("./processed_data/julian_day_of_burn.tiff")
+plot(dob)
+# get unique dob values, sort them, and convert to Date objects
+dates <- unique(dob) %>%
+  pull(1) %>%
+  sort
 
-downloader::download(
-  url = "http://www.northwestknowledge.net/metdata/data/vs_2022.nc",
-  destfile = "raw_data/vs_2022.nc",
-  mode = 'wb'
-)
+## HPCC burn perimeter ####
+burn_perimeter<-read_sf("./processed_data/burn_perimeter.shp")
 
-downloader::download(
-  url = "http://www.northwestknowledge.net/metdata/data/th_2022.nc",
-  destfile = "raw_data/th_2022.nc",
-  mode = 'wb'
-)
-
-downloader::download(
-  url = "http://www.northwestknowledge.net/metdata/data/fm100_2022.nc",
-  destfile = "raw_data/fm100_2022.nc",
-  mode = 'wb'
-)
-
-downloader::download(
-  url = "http://www.northwestknowledge.net/metdata/data/fm1000_2022.nc",
-  destfile = "raw_data/fm1000_2022.nc",
-  mode = 'wb'
-)
-
-downloader::download(
-  url = "http://www.northwestknowledge.net/metdata/data/tmmx_2022.nc",
-  destfile = "raw_data/tmmx_2022.nc",
-  mode = 'wb'
-)
-
-
-# load CBI raster
-CBI<-raster("./raw_data/burn_severity/ravg_2022_cbi4.tif")
-CBI[CBI==9]<-NA # 9 is the code for unmappable and I need it to not be considered as a number
-CBI[CBI==0]<-1 # in the raw data a zero is outside of the fire perimiter and a 1 is a pixel that is unchanged. For this analysis we consider these to be similar. For instance, when kriging it is better to have the information from the area outside the perimiter considered as unchanged instead of unknown. 
-
-## load progression raster
-progression<-raster("./processed_data/julian_day_of_burn_masked.tiff")
-
-dates<-sort(unique(progression$layer))
-dates_converted<-as.Date(dates,origin=as.Date("2024-01-01"))
-
-
-#first_day_of_fire<-progression[progression$GDB_FROM_D==dates[1],]
-
-
-### load weather data
-
-ycell<-CBI@nrows
-xcell<-CBI@ncols
-bounds<-st_bbox(CBI)
-######################### Raster of Vegetation Treatments with a 10m buffer
-
-empty_raster<-raster(nrows=ycell,ncols=xcell,xmn=bounds[1],xmx=bounds[3],ymn=bounds[2],ymx=bounds[4],crs=st_crs(CBI))
-empty_raster$dummy=1
-
-
-burn_perimiter<-read_sf("./processed_data/burn_perimiter.shp")
-
-progression
-
-
-
-#https://tmieno2.github.io/R-as-GIS-for-Economists/gridMET.html
-
-fm100<-projectRaster(raster("./raw_data/fm100_2022.nc",as.numeric(format(dates_converted[1],"%j"))),to=CBI) ## 100 hour fuel moisture
-fm1000<-projectRaster(raster("./raw_data/fm1000_2022.nc",as.numeric(format(dates_converted[1],"%j"))),to=CBI) ## 1000 hour fuel moisture
-vs<-projectRaster(raster("./raw_data/vs_2022.nc",as.numeric(format(dates_converted[1],"%j"))),to=CBI) ## wind speed at 10 M
-rmax<-projectRaster(raster("./raw_data/rmax_2022.nc",as.numeric(format(dates_converted[1],"%j"))),to=CBI) ## rel humidity maximum
-th<-projectRaster(raster("./raw_data/th_2022.nc",as.numeric(format(dates_converted[1],"%j"))),to=CBI) ## high temp wind direction at 10m
-tmax<-projectRaster(raster("./raw_data/tmmx_2022.nc",as.numeric(format(dates_converted[1],"%j"))),to=CBI) ## high temp wind direction at 10m
-
-weather_raster<-data.frame(rasterToPoints(progression==dates[1]))
-weather_raster<-weather_raster[weather_raster$layer==1,]
-
-
-weather_raster$fm100<-raster::extract(fm100,weather_raster[,1:2])
-weather_raster$fm1000<-raster::extract(fm1000,weather_raster[,1:2])
-weather_raster$vs<-raster::extract(vs,weather_raster[,1:2])
-weather_raster$rmax<-raster::extract(rmax,weather_raster[,1:2])
-weather_raster$th<-raster::extract(th,weather_raster[,1:2])
-weather_raster$tmmx<-raster::extract(th,weather_raster[1,2])
-
-weather_raster$day_of_burn<-dates_converted[1]
-
-weather_raster$xy<-paste(weather_raster$x,weather_raster$y,sep="_")
-
-
-## looping through the burn days and extracting the weather data for the appropriate cells. 
-for (i in 2:length(dates)){
-  # Nate: if I were to refactor something, maybe I'd start here?
-  fm100<-projectRaster(raster("./raw_data/fm100_2022.nc",as.numeric(format(dates_converted[i],"%j"))),to=CBI)
-  fm1000<-projectRaster(raster("./raw_data/fm1000_2022.nc",as.numeric(format(dates_converted[i],"%j"))),to=CBI)
-  vs<-projectRaster(raster("./raw_data/vs_2022.nc",as.numeric(format(dates_converted[i],"%j"))),to=CBI)
-  rmax<-projectRaster(raster("./raw_data/rmax_2022.nc",as.numeric(format(dates_converted[i],"%j"))),to=CBI)
-  th<-projectRaster(raster("./raw_data/th_2022.nc",as.numeric(format(dates_converted[i],"%j"))),to=CBI)
-  tmmx<-projectRaster(raster("./raw_data/tmmx_2022.nc",as.numeric(format(dates_converted[i],"%j"))),to=CBI)
-  
-
-  weather_raster_new<-data.frame(rasterToPoints(progression==dates[i]))
-  weather_raster_new<-weather_raster_new[weather_raster_new$layer==1,]
-
-  weather_raster_new$fm100<-raster::extract(fm100,weather_raster_new[,1:2])
-  weather_raster_new$fm1000<-raster::extract(fm1000,weather_raster_new[,1:2])
-  weather_raster_new$vs<-raster::extract(vs,weather_raster_new[,1:2])
-  weather_raster_new$rmax<-raster::extract(rmax,weather_raster_new[,1:2])
-  weather_raster_new$th<-raster::extract(th,weather_raster_new[,1:2])
-  weather_raster_new$xy<-paste(weather_raster_new$x,weather_raster_new$y,sep="_")
-  weather_raster_new$tmmx<-raster::extract(tmmx,weather_raster_new[,1:2])
-  
-  weather_raster_new$day_of_burn<-dates_converted[i]
-  
-  weather_raster_new<-weather_raster_new[weather_raster_new$xy %in% weather_raster$xy==FALSE,]
-  
-  weather_raster<-rbind(weather_raster,weather_raster_new)
-  
+## weather ####
+# define vector of weather variables
+weather_vars <- c("rmax", "vs", "th", "fm100", "fm1000", "tmmx")
+# optional: download new weather data to disk. set new_dl == TRUE to download.
+new_dl <- FALSE
+if (new_dl == TRUE) {
+  map(weather_vars,
+      \(x) {
+        download(
+          url = paste0("http://www.northwestknowledge.net/metdata/data/",
+                       x,
+                       "_2022.nc"),
+          destfile = paste0("raw_data/", x, "_2022.nc"),
+          mode = 'wb'
+        )
+      })
 }
+# load the weather data from disk
+weather_rasts <- map(
+  weather_vars,
+  \(x) {
+    # read in rasters, subset to get the bands for the relevant days only
+    rast(paste0("./raw_data/", x, "_2022.nc"), lyrs = dates)
+  }) %>%
+  # stack all bands: 6 vars * 71 days = 426 bands
+  rast %>%
+  project(cbi)
 
-weather_raster_total<-rasterFromXYZ(weather_raster,crs=crs(CBI))
+# tidy layer names and set time value to dob
+names(weather_rasts) <- rep(weather_vars, each = length(dates))
+time(weather_rasts) <- rep(dates, 6)
 
-#weather_raster_total<-raster::mask(weather_raster_total,st_cast(first_day_of_fire,to="POLYGON"))
+# map over the rasters and mask them by the appropriate date subset of the dob
+# raster.
+weather_masked <- map(
+  dates,
+  # i == the ordinal day of burn
+  \(i) {
+    # i = 104
+    # create dob mask
+    msk <- ifel(dob == i, 1, NA)
+    # plot(msk)
+    # select the raster layers with the target i
+    weather_rasts_subset <- weather_rasts[[time(weather_rasts) == i]]
+    # plot(weather_rasts_subset,
+    #      main = paste("Weather data for day of burn:", i))
+    # mask them
+    masked_weather_rasts <- mask(weather_rasts[[time(weather_rasts) == i]], msk)
+    # plot(masked_weather_rasts,
+    #      main = paste("masked:", i))
+  },
+  .progress = "Masking weather rasters..."
+) %>%
+  do.call(c, .)
 
-mapview(weather_raster_total$fm100)
+# composite the partial rasters for each output variable
+weather_composites <-  map(
+  weather_vars,
+  \(x) {
+    # select all the rasters for the variable x
+    var_subset <- weather_masked[[grep(x, names(weather_masked))]]
+    # plot(var_subset[[1:5]],
+    #      main = paste("var:", x, " day:", dates[1:5]))
+    # get first non-na layer value (there should only be one)
+    out <- app(var_subset, mean, na.rm = TRUE, wopt = list(names = x))
+  },
+  .progress = "Building composites..."
+) %>%
+  do.call(c, .)
+
+plot(weather_composites)
 
 
-## rename for the difference columns
-writeRaster(weather_raster_total$fm1000,filename = "./processed_data/fm1000.tif",overwrite=TRUE)
-writeRaster(weather_raster_total$fm100,filename = "./processed_data/fm100.tif",overwrite=TRUE)
-writeRaster(weather_raster_total$vs,filename = "./processed_data/vs.tif",overwrite=TRUE)
-writeRaster(weather_raster_total$rmax,filename = "./processed_data/rmax.tif",overwrite=TRUE)
-writeRaster(weather_raster_total$th,filename = "./processed_data/th.tif",overwrite=TRUE)
-writeRaster(weather_raster_total$tmmx,filename = "./processed_data/tmmx.tif",overwrite=TRUE)
+# create control plots ####
 
-
-
-############################################
-
-#####  Create a grid of control plots. Control plots will be 10 acre circles to match the validation plots. They will be built on a grid.The area of square grid cell that that contains a 10 acre is 12.732 acres
+# Create a grid of control plots. Control plots will be 10 acre circles to match
+# the validation plots. They will be built on a grid.The area of square grid
+# cell that that contains a 10 acre is 12.732 acres
 
 burn_perimiter<-read_sf("./processed_data/burn_perimiter.shp")
 
@@ -191,7 +150,7 @@ fm1000<-raster("./processed_data/fm1000.tif")
 masked_cbi<-raster("./processed_data/masked_raster.tif")
 masked_cbi[masked_cbi==9]<-NA
 masked_cbi[masked_cbi==0]<-1
-# Nate: terra::extract is supposed to be faster. Maybe a good place to use mclapply as well. 
+# Nate: terra::extract is supposed to be faster. Maybe a good place to use mclapply as well.
 gridded_plots$elevation<-raster::extract(elev_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
 gridded_plots$aspect<-raster::extract(aspect_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
 gridded_plots$tri<-raster::extract(TRI_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
