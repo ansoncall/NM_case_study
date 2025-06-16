@@ -2,14 +2,16 @@
 # the burn severity analysis. it (optionally) downloads gridmet data, processes
 # it, and extracts relevant features for each day of the burn. It also creates a
 # grid of control plots based on the burn perimeter and extracts environmental
-# features for these plots.
+# features for these plots. this script should take less than an hour to run on
+# most laptops - ~32 minutes on a 2022ish laptop with 32 GB ram.
 
 # load packages ####
 library(tidyverse)
 library(downloader)
 library(sf)
 library(terra)
-library(conflicted)
+library(exactextractr)
+
 # set options ####
 # boost terra memory usage and never display progress bar
 terraOptions(memfrac = 0.8, progress = 0)
@@ -23,18 +25,16 @@ cbi <- rast("./processed_data/clipped_burn_raster.tif") %>%
   # 0 == outside the fire perimeter and 1 == inside, but unburned. here, we
   # consider these to be the same.
   subst(0, 1)
-plot(cbi)
 
 ## day of burn (DOB) ####
 dob <- rast("./processed_data/julian_day_of_burn.tiff")
-plot(dob)
 # get unique dob values, sort them, and convert to Date objects
 dates <- unique(dob) %>%
   pull(1) %>%
   sort
 
 ## HPCC burn perimeter ####
-burn_perimeter<-read_sf("./processed_data/burn_perimeter.shp")
+burn_perimeter <- read_sf("./processed_data/burn_perimeter.shp")
 
 ## weather ####
 # define vector of weather variables
@@ -49,7 +49,7 @@ if (new_dl == TRUE) {
                        x,
                        "_2022.nc"),
           destfile = paste0("raw_data/", x, "_2022.nc"),
-          mode = 'wb'
+          mode = "wb"
         )
       })
 }
@@ -59,118 +59,203 @@ weather_rasts <- map(
   \(x) {
     # read in rasters, subset to get the bands for the relevant days only
     rast(paste0("./raw_data/", x, "_2022.nc"), lyrs = dates)
-  }) %>%
+  }
+) %>%
   # stack all bands: 6 vars * 71 days = 426 bands
   rast %>%
   project(cbi)
-
 # tidy layer names and set time value to dob
 names(weather_rasts) <- rep(weather_vars, each = length(dates))
 time(weather_rasts) <- rep(dates, 6)
-
 # map over the rasters and mask them by the appropriate date subset of the dob
-# raster.
+# raster
 weather_masked <- map(
   dates,
   # i == the ordinal day of burn
   \(i) {
-    # i = 104
     # create dob mask
     msk <- ifel(dob == i, 1, NA)
-    # plot(msk)
     # select the raster layers with the target i
     weather_rasts_subset <- weather_rasts[[time(weather_rasts) == i]]
-    # plot(weather_rasts_subset,
-    #      main = paste("Weather data for day of burn:", i))
     # mask them
     masked_weather_rasts <- mask(weather_rasts[[time(weather_rasts) == i]], msk)
-    # plot(masked_weather_rasts,
-    #      main = paste("masked:", i))
   },
   .progress = "Masking weather rasters..."
 ) %>%
+  # stack result into single multiband raster
   do.call(c, .)
-
 # composite the partial rasters for each output variable
-weather_composites <-  map(
+weather_composites <- map(
   weather_vars,
   \(x) {
     # select all the rasters for the variable x
     var_subset <- weather_masked[[grep(x, names(weather_masked))]]
-    # plot(var_subset[[1:5]],
-    #      main = paste("var:", x, " day:", dates[1:5]))
-    # get first non-na layer value (there should only be one)
-    out <- app(var_subset, mean, na.rm = TRUE, wopt = list(names = x))
+    # use any function to summarize layers (there is only one non-NA value per
+    # pixel and layer). median() is reasonably fast.
+    out <- app(var_subset, median, na.rm = TRUE, wopt = list(names = x))
   },
   .progress = "Building composites..."
 ) %>%
   do.call(c, .)
+# view composite rasters. Nate: check
+plot(weather_composites, main = weather_vars)
 
-plot(weather_composites)
-
-
-# create control plots ####
+# control plots ####
+## create geometries ####
 
 # Create a grid of control plots. Control plots will be 10 acre circles to match
-# the validation plots. They will be built on a grid.The area of square grid
-# cell that that contains a 10 acre is 12.732 acres
+# the validation plots. They will be built on a square grid.The area of square
+# grid cell that that contains a 10 acre is 12.732 acres (confirmed. -Anson)
 
-burn_perimiter<-read_sf("./processed_data/burn_perimiter.shp")
+# total burned area in acres
+# Nate: shouldn't we be buffering the burn perimeter so we don't end up with
+# circular plots hanging over the edge of the burn perimeter? I didn't see you
+# doing this in this script. Probably more efficient to buffer up front so you
+# don't have to run an extra geoprocessing operation on thousands of polygons
+# later on.
+total_burn_area <- sum(st_area(st_buffer(burn_perimeter,
+                                         dist = -113.49694))) / 4046.68
 
-total_burn_area<-sum(st_area(burn_perimiter))/4046.68 ## total burn acres
+# the area in 12.732 acre units--the maximum possible number of control plots,
+# not accounting for square-packing in non-square areas.
+how_may_cells <- as.numeric(total_burn_area) / 12.732
 
-how_may_cells<-as.numeric(total_burn_area)/12.732
+# sample points in the burn perimeter to create a regular grid of control plot
+# centers. size parameter is used to specify an *approximate* number of points
+# to return.
+gridded_points <- st_sample(st_buffer(burn_perimeter, dist = -113.49694),
+                            size = round(how_may_cells, 0),
+                            type = "regular")
 
-gridded_points<-st_sample(burn_perimiter,size=round(how_may_cells,0),type="regular")
+# buffer points by 113.49... meters to create circular 10 acre polygons.
+# (pi*113.49694^2)/4046.86 == 10 acres. (checked. -Anson)
+gridded_plots <- st_buffer(gridded_points, dist = 113.49694) %>% st_as_sf
 
-gridded_plots<-st_buffer(st_as_sf(gridded_points),dist=113.49694)
+# # Nate: check
+# mapview::mapview(burn_perimeter) +
+#   mapview::mapview(gridded_plots, color = "red", alpha = 0.5) # nolint
 
-mapview(gridded_plots)
+## load additional data ####
+# topography
+topo_vars <- c("elev", "aspect", "TRI", "TPI", "slope")
+topo_rasts <- map(
+  topo_vars,
+  \(x) {
+    # load rasters, project to cbi crs, and rename layers
+    rast(paste0("./processed_data/", x, "_down.tif")) %>%
+      project(cbi) %>%
+      setNames(x)
+  }
+) %>%
+  do.call(c, .)
 
-## grid plots are made now need to extract all of the data for each gridded plot
+# roads, LandFire site potential
+roads_distance <- rast("./processed_data/distance_to_road.tif")
+site_potential <- rast("./processed_data/lf_site_potential_new.tif")
+# set active category of LF site potential to 2, which is the fine-scale
+# zone*esp*esplf categorization
+activeCat(site_potential) <- 2
 
-elev_down<-raster("./processed_data/elev_down.tif")
-aspect_down<-raster("./processed_data/aspect_down.tif")
-TRI_down<-raster("./processed_data/TRI_down.tif")
-TPI_down<-raster("./processed_data/TPI_down.tif")
-slope_down<-raster("./processed_data/slope_down.tif")
-roads_distance<-raster("./processed_data/distance_to_road.tif")
-site_potential<-raster("./processed_data/lf_site_potential_new.tif")
-ppt<-raster("./processed_data/ppt.tif")
-tmin<-raster("./processed_data/tmin.tif")
-tmmx<-raster("./processed_data/tmmx.tif")
-th<-raster("./processed_data/th.tif")
-vpdmax<-raster("./processed_data/vpdmax.tif")
-rmax<-raster("./processed_data/rmax.tif")
-vs<-raster("./processed_data/vs.tif")
-fm100<-raster("./processed_data/fm100.tif")
-fm1000<-raster("./processed_data/fm1000.tif")
+# compile full multiband raster
+# all layers, excluding the categorical site_potential layer
+all_layers <- c(
+  topo_rasts, roads_distance, weather_composites, cbi
+) %>%
+  # set names for the layers
+  setNames(c(topo_vars, "road", weather_vars, "cbi"))
 
+# Nate: check
+plot(all_layers, main = names(all_layers))
+plot(site_potential, main = "esp")
 
-masked_cbi<-raster("./processed_data/masked_raster.tif")
-masked_cbi[masked_cbi==9]<-NA
-masked_cbi[masked_cbi==0]<-1
-# Nate: terra::extract is supposed to be faster. Maybe a good place to use mclapply as well.
-gridded_plots$elevation<-raster::extract(elev_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$aspect<-raster::extract(aspect_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$tri<-raster::extract(TRI_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$tpi<-raster::extract(TPI_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$slope<-raster::extract(slope_down,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$road<-raster::extract(roads_distance,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$esp<-raster::extract(site_potential,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$cbi<-raster::extract(masked_cbi,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$fm1000<-raster::extract(fm1000,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$fm100<-raster::extract(fm100,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$ppt<-raster::extract(ppt,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$tmin<-raster::extract(tmin,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$tmmx<-raster::extract(tmmx,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$th<-raster::extract(th,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$vpdmax<-raster::extract(vpdmax,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$rmax<-raster::extract(rmax,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$vs<-raster::extract(vs,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$fm100<-raster::extract(fm100,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$fm100<-raster::extract(fm100,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-gridded_plots$fm1000<-raster::extract(fm1000,st_as_sf(gridded_plots),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
+## extract values ####
 
+# Nate: previously, esp values were extracted in the same way as the other
+# continuous values, i.e. using fun = "mean". This seems inappropriate for
+# factor values. Here, we take the mode to extract the most common cover type
+# within each control plot. This loses some information about the secondary
+# cover types and the proportions of each cover type, but it maintains
+# compatibility with the downstream analysis and makes more sense than averaging
+# the numerical values, which are actually codes for qualitative cover type
+# descriptions.
 
-write_sf(gridded_plots,dsn="gridded_candidate_plots.shp")
+# # aside: it seems like normalizeWeights is unnecessary; see examples in help.
+# # Also, it was breaking the code and idk why. Says normalizeWeights argument
+# # was unused even though I was specifying the raster namespace. See:
+# nolint start
+# test <- all_layers["cbi"]
+# # broken:
+# raster::extract(test, st_as_sf(gridded_plots), fun = mean, na.rm = TRUE,
+#                 weights = TRUE, exact = TRUE, normalizeWeights = TRUE,
+#                 small = TRUE)
+# # works (took me 40 minutes to run):
+# tictoc::tic()
+# testout <- raster::extract(
+#   test, st_as_sf(gridded_plots), fun = mean, na.rm = TRUE, weights = TRUE,
+#   exact = TRUE, small = TRUE
+# )
+# tictoc::toc()
+# nolint end
+# aside 2: switching to exactextractr::exact_extract for performance. I spot
+# checked with CBI and this will return almost exactly the same result you had
+# previously.
+
+## extract modal esp ####
+gridded_plots$esp <- exact_extract(site_potential,
+                                   gridded_plots,
+                                   fun = "mode",
+                                   weights = "area",
+                                   progress = TRUE)
+
+## extract mean aspect ####
+# Nate: aspect is in degrees. This is going to create averaging problems when we
+# extract to the control plots. We should convert to "northness" and "eastness"
+# before averaging, then convert back to degrees after averaging.
+plot(all_layers["aspect"], main = "aspect")
+### convert aspect to uv component vectors ####
+# define function to convert aspect to uv component vectors
+aspect_to_uv <- function(aspect_degrees) {
+  # Convert to radians
+  aspect_radians <- aspect_degrees * pi / 180
+  # Compute x and y components
+  u <- cos(aspect_radians)
+  v <- sin(aspect_radians)
+  c(u, v)
+}
+# apply uv function to aspect layer
+aspect_uv <- all_layers["aspect"] %>%
+  app(aspect_to_uv, wopt = list(names = c("aspect_u", "aspect_v")))
+plot(aspect_uv, main = names(aspect_uv))
+
+# calculate means of u and v
+uv <- exact_extract(aspect_uv,
+                    gridded_plots,
+                    fun = "mean",
+                    weights = "area",
+                    stack_apply = TRUE,
+                    force_df = TRUE,
+                    progress = TRUE)
+### convert mean uv back to bearings ####
+# radians, counterclockwise from x axis (east)
+angles_rad <- atan2(uv$mean.aspect_v, uv$mean.aspect_u)
+# convert to degrees, clockwise from north. assign to gridded_plots.
+gridded_plots$aspect <- (450 - angles_rad * 180 / pi) %% 360
+
+# extract means for other variables ####
+var_means <- exact_extract(all_layers[[-2]], # exclude aspect
+                           gridded_plots,
+                           fun = "mean",
+                           weights = "area",
+                           stack_apply = TRUE,
+                           colname_fun = \(values, ...) values,
+                           progress = TRUE)
+gridded_plots <- cbind(gridded_plots, var_means)
+
+# write out ####
+## weather rasters ####
+writeRaster(weather_composites,
+            filename = "./processed_data/weather_composite.tif",
+            overwrite = TRUE)
+## gridded control plots ####
+write_sf(gridded_plots, dsn = "./processed_data/gridded_candidate_plots.shp")
+tictoc::toc()
