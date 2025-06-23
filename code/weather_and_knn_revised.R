@@ -98,6 +98,7 @@ weather_composites <- map(
 ) %>%
   do.call(c, .)
 # view composite rasters. Nate: check
+weather_composites <-  rast("./processed_data/weather_composite.tif")
 plot(weather_composites, main = weather_vars)
 
 # control plots ####
@@ -126,14 +127,16 @@ how_may_cells <- as.numeric(total_burn_area) / 12.732
 gridded_points <- st_sample(st_buffer(burn_perimeter, dist = -113.49694),
                             size = round(how_may_cells, 0),
                             type = "regular")
+# TODO maybe get rid of plots that fall within treatments at this stage to speed
+# up downstream stuff
 
 # buffer points by 113.49... meters to create circular 10 acre polygons.
 # (pi*113.49694^2)/4046.86 == 10 acres. (checked. -Anson)
 gridded_plots <- st_buffer(gridded_points, dist = 113.49694) %>% st_as_sf
 
-# # Nate: check
-# mapview::mapview(burn_perimeter) +
-#   mapview::mapview(gridded_plots, color = "red", alpha = 0.5) # nolint
+# Nate: check
+mapview::mapview(burn_perimeter) +
+  mapview::mapview(gridded_plots, color = "red", alpha = 0.5) # nolint
 
 ## load additional data ####
 # topography
@@ -201,6 +204,8 @@ plot(site_potential, main = "esp")
 # previously.
 
 ## extract modal esp ####
+# TODO: remove esp stuff from gridded plots.
+# esp is not used in propensity score matching, so we dont even need to do this.
 gridded_plots$esp <- exact_extract(site_potential,
                                    gridded_plots,
                                    fun = "mode",

@@ -1,525 +1,757 @@
-#load packages
-library(ggplot2)
-library(dplyr)
+# this script compares the accuracy of methods used to create counterfactual
+# outcomes. it is a core part of the analysis.
+
+# load packages ####
+library(tidyverse)
 library(sf)
-library(raster)
-library(stars)
-library(elevatr)
-library(mapview)
+library(terra)
 library(ranger)
 library(SpatialML)
 library(tuneRanger)
 library(spmodel)
-library(forcats)
 library(caret)
-# load data
+library(exactextractr)
+library(conflicted)
 
-# validation plots are the randomly selected plots that the different methods
-# will be evalauted across. It contains both the validation plots and the
-# practitioner generated controls
-validation_plots<-read_sf("./processed_data/val_points_revised.shp",fid_column_name="ID")
+# set options ####
+conflicts_prefer(dplyr::filter)
 
-# pairing is the information about how to match the practitioner generated controls
-pairing<-read.csv("./processed_data/plot_matching.csv")
+#load data ####
+# validation and control plots ####
+# validation plots are the randomly selected plots used to evaluate the accuracy
+# of the different methods. "control" plots are the practitioner-generated
+# control plots. both are included in this file.
+validation_and_control_plots <- read_sf(
+  "./processed_data/val_points_revised.shp",
+  fid_column_name = "ID"
+)
 
-# gridded_plots are for the propensity score matching
-gridded_plots<-read_sf("gridded_candidate_plots.shp")
+## pairing information ####
+# "pairing" is a lookup table that matches validation plots with their
+# respective practitioner-generated control plots, along with some notes. this
+# table was manually created during the creation of the practitioner-generated
+# control plots. note that some practitioner-generated control plots were used
+# twice, such that the number of validation plots exceeds the number of
+# practitioner-generated control plots.
+pairing <- read.csv("./processed_data/plot_matching.csv")
 
-masked_cbi<-raster("./processed_data/masked_raster.tif")
+## gridded candidate plots ####
+# "gridded_plots" includes all possible 10-acre plots in a regular grid and is
+# used for propensity score matching
+gridded_plots <- read_sf("./processed_data/gridded_candidate_plots.shp")
 
-masked_cbi[masked_cbi==9]<-NA
-masked_cbi[masked_cbi==0]<-1
+## composite burn index (CBI) raster ####
+cbi <- rast("./processed_data/masked_raster.tif")
+# as usual, set "unmappable" -> NA and "outside of perimeter" -> 1 (unburned)
+cbi[cbi == 9] <- NA
+cbi[cbi == 0] <- 1
 
-CBI[CBI==9]<-NA
-CBI[CBI==0]<-1
+# analysis ####
+## practitioner-generated controls ####
+# extract CBI values for all random, non-treated validation and
+# practitioner-generated control plots.
+plot_method_cbi <- tibble(
+  # FID is the plot's unique identifier
+  "FID" = validation_and_control_plots$ID,
+  # extract mean CBI. ignores NA values.
+  "cbi" = exact_extract(!!cbi,
+                        validation_and_control_plots,
+                        fun = "mean",
+                        weights = "area",
+                        progress = TRUE),
+  # calculate proportion of plot covered by NA values.
+  "prop_na" = exact_extract(!!cbi,
+                            validation_and_control_plots,
+                            fun = "frac",
+                            weights = "area",
+                            # sets default value for NA values to 5, so that it
+                            # is not ignored by "frac" calculation
+                            default_value = 5,
+                            progress = TRUE)[[5]]
+  ) %>%
+  # remove plots with >= 20% NA values (=9 plots)
+  filter(prop_na < 0.2) %>%
+  select(-prop_na)
 
-## this is for the practitioner generated controls
-plot_method_cbi<-as.data.frame(raster::extract(CBI,st_as_sf(validation_plots),fun=mean,na.rm=FALSE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE))
+# use "pairing" to pair validation plots with practitioner-generated controls in
+# wide df. validation plots were created first and have low FIDs.
+validations <- plot_method_cbi %>% filter(as.integer(FID) < 352)
+controls <- plot_method_cbi %>% filter(as.integer(FID) >= 352)
+compare <- pairing %>%
+  # IDs must be of same type for use as join keys
+  mutate(FID_validation = as.character(FID_1),
+         FID_control = as.character(FID.of.New.plot)) %>%
+  # get cbi values for validation plots
+  left_join(plot_method_cbi,
+            by = c("FID_validation" = "FID")) %>%
+  left_join(plot_method_cbi, by = c("FID_control" = "FID")) %>%
+  # rename to differentiate different CBI values
+  rename(cbi_validation = cbi.x,
+         cbi_control = cbi.y) %>%
+  # finally, drop the extra cols
+  select(5:8) %>%
+  # remove rows with NA values
+  filter(complete.cases(.))
 
-plot_method_cbi<-data.frame(FID=validation_plots$ID,cbi=plot_method_cbi$V1)
-# Nate: double check that the subsetting is correct here. 
-validation_cbi<-plot_method_cbi[plot_method_cbi$FID>352,]
+# plot control vs. validation
+plot(compare$cbi_control, compare$cbi_validation,
+     xlab = "Practitioner-generated control plot",
+     ylab = "Validation plot")
 
+# Simple perimeters ####
+# get geometry of original validation plots
+validation_plots <- validation_and_control_plots %>%
+  filter(ID %in% compare$FID_validation)
+# demonstrate math for calculating "donut" statistics:
+# we want to make a 10-acre donut, centered on the original plots.
+# the inner radius of the donut is the radius of a 10-acre circle () + 60m:
+one_plot <- validation_plots[1, ] # grab a sample plot
+plot_area_m <- st_area(one_plot) # in m2, == 10 acres
+inner_radius = as.numeric(sqrt(plot_area_m / pi)) + 60 # all in meters
+# the outer radius is the radius of a circle with that gives an area equal to 10
+# acres (40450.11078 m2) + the area of the inner circle.
+inner_circle_area = inner_radius^2 * pi # in m2
+outer_circle_area = inner_circle_area + as.numeric(plot_area_m) # +10 acres
+outer_radius = sqrt(outer_circle_area / pi) # in m2
+# the target donut shape is a ~33m wide ring:
+outer_radius - inner_radius # in m
+# generate donut geometries
+plot_centers <- validation_plots %>% st_centroid()
+donuts_outer <- plot_centers %>%
+  st_buffer(dist = outer_radius) %>%
+  st_geometry
+donuts_inner <- plot_centers %>%
+  st_buffer(dist = inner_radius) %>%
+  st_geometry
+donuts <- map2(donuts_outer, donuts_inner, st_difference) %>%
+  st_sfc %>%
+  st_sf(geometry = .) %>%
+  # set projection
+  st_set_crs(st_crs(validation_plots))
+# assign FIDs
+donuts$FID <- validation_plots$ID
+# extract CBI for all donuts and add to compare
+donuts$cbi_perimeter <- exact_extract(cbi,
+                                       donuts,
+                                       fun = "mean",
+                                       weights = "area",
+                                       progress = TRUE)
 
-control_plots<-merge(plot_method_cbi,pairing,by.x="FID",by.y="FID_1")
+# add donut CBI values to compare df
+compare <- left_join(compare,
+                     as.data.frame(donuts),
+                     by = c("FID_validation" = "FID"))
 
-names(control_plots)[names(control_plots) == "cbi"] <- "origional_plot_cbi"
+# plot
+plot(compare$cbi_perimeter, compare$cbi_validation,
+     xlab = "Perimeter control plot",
+     ylab = "Validation plot")
 
-paired_plots<-merge(control_plots,validation_cbi,by.x="FID.of.New.plot",by.y="FID")
+# random forest ####
+## load additional data ####
+# LandFire ESP
+site_potential <- rast("./processed_data/lf_site_potential_new.tif")
+# set active category to 2, which is the fine-scale zone*esp*esplf categorization
+activeCat(site_potential) <- 2
+names(site_potential) <- "esp"
+# HPCC burn perimeter
+burn_perimiter <- read_sf("./processed_data/burn_perimiter.shp")
+# cbi raster, masked by original plots + 60m buffer
+validation_mask_cbi <- mask(cbi, st_buffer(validation_plots, 60), inverse=TRUE)
+names(validation_mask_cbi) <- "masked_cbi"
+# treatments
+veg_treatments <- read_sf("./processed_data/vegetation_treatments_hpcc.shp") %>%
+  st_make_valid
+# additional variables
+raster_filenames <- c(
+  "elev_down", "aspect_down", "TRI_down", "TPI_down", "slope_down",
+  "distance_to_road", "ppt", "tmin", "tmmx", "th",
+  "vpdmax", "rmax", "vs", "fm100", "fm1000"
+)
+raster_varnames <- c(
+  "elev", "aspect", "tri", "tpi", "slope", "roads_distance", "ppt",
+  "tmin", "tmmx", "th", "vpdmax", "rmax", "vs", "fm100", "fm1000"
+)
+rasts <- map(raster_filenames, function(x) {
+  # load each raster file
+  rast(paste0("./processed_data/", x, ".tif"))
+}) %>%
+  # unlist
+  rast
+# set names for each layer
+names(rasts) <- raster_varnames
+# rename and combine other raster layers
+names(cbi) <- "cbi"
+rasts <- c(rasts, site_potential, cbi, validation_mask_cbi)
+plot(rasts)
+plot(rasts[[17:18]])
+## build dataframes ####
+rasts_train <- rasts %>%
+  # mask out validation plots with 60m buffer
+  mask(st_buffer(validation_plots, 60), inverse = TRUE)
+plot(rasts_train[[3]])
+rasts_test <- rasts %>%
+  # remove masked_cbi, as it is not used in testing
+  tidyterra::select(-masked_cbi) %>%
+  # keep only validation plots. add small buffer to ensure entire plot is
+  # included in result, as mask() is seemingly not precise? (Nate: check)
+  mask(st_buffer(validation_plots, 30))
+# mapview::mapview(rasts_test[[3]]) + mapview::mapview(validation_plots) # nolint
 
-
-################# How well did the handmade controls do?
-
-compare_df<-data.frame(plot_id=paired_plots$FID,origional_plot_cbi=paired_plots$origional_plot_cbi,control_plot_cbi=paired_plots$cbi,skip=paired_plots$skip)
-
-compare_df<-compare_df[is.na(compare_df$origional_plot_cbi)==FALSE,]
-compare_df<-compare_df[is.na(compare_df$control_plot_cbi)==FALSE,]
-
-plot(compare_df$control_plot_cbi,compare_df$origional_plot_cbi)
-
-origional_plots<-validation_plots[validation_plots$ID %in% compare_df$plot_id,]
-
-############# Simple perimiters 
-
-# "We also used an alternative method that defines the post hoc control as a
-# simple 4-hectare buffer around the validation plot, which we call the “buffer
-# method” (Vorster et al. 2023). As with the other methods, a 60-m wide buffer
-# around the validation plot was removed to minimize edge effects, and a
-# 4-hectare area around the excluded area was summarized to estimate the
-# counterfactual burn severity (Figure S2). 
- 
-# Nate: I'm not following along 100% since I'm just reading the code, not
-# running it. That said, it looks like you are taking a
-
-
-# the correct math(?):
-# original plot radius (in meters)
-og_plot_radius = sqrt(10*4046.86/pi)
-# add 60 m buffer
-inner_ring = og_plot_radius + 60
-# need to know area of original plot + buffer
-inner_ring_area = pi*inner_ring^2
-inner_ring_area/4046.86 
-# okay, supplement S2 shows a 10 acre buffer area, but the text says 4 ha buffer
-# area. I'll do the math for both. 
-
-# now calculate the desired outer ring area (inner ring area + ac)
-# (choose one)
-total_area = inner_ring_area + 40000 # 40,000 m2 == 4 hectares 
-# total_area = inner_ring_area + (10*4046.86) # 40,000 m2 == 4 hectares
-# now calculate the outer ring radius
-outer_ring_radius = sqrt(total_area/pi)
-# check final area
-outer_ring_area = pi*outer_ring_radius^2
-final_area = outer_ring_area - inner_ring_area # checks out
-
-# I think this is just leftover from double checking?
-size_of_perimiter<-sqrt((33*4046.86)/pi)-sqrt((10*4046.86)/pi) # not sure where 33 comes from? possibly og 10 acres + 60 m buffer area + new 10 acres?
-perimiters<-st_buffer(origional_plots,size_of_perimiter,allow_holes=TRUE) # what is allow_holes doing?
-st_area(perimiters)/4046.86
-og_plots<-st_buffer(origional_plots,60)
-st_area(og_plots)/4046.86
-
-
-test_outer_ring_area = pi*size_of_perimiter^2
-
-
-
-perimiter_extract<-raster::extract(masked_cbi,st_as_sf(perimiters),na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-origional_extract<-raster::extract(masked_cbi,st_as_sf(og_plots),na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-
-compare_df$buffer_method<-NA
-
-# another place to refactor. Can use terra::extract and parallelize. 
-for (i in 1:nrow(compare_df)){
-  one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
-  
-  area_of_plot<-st_area(one_plot)/4046.86 # dividing by 4046, so I assume the units are m2 and you want acres. This should be ==10.
-  
-  buffer_plot<-st_buffer(one_plot,60) # adding 60m buffer, adding 60m to the radius, buffer plot is now ~94565 m2 or ~23.36 acres in area. 
-  area_of_plot_with_buffer<-st_area(buffer_plot)/4046.86 # should be ~23.36 acres. 
-  # it looks like size_of_perimeter is the buffer size. to calc this, you want
-  # to take the ~23 acre buffer_plot, add 10 acres in area, then take the radius
-  # of that area, then subtract the original radius. That would give you the
-  # correct parameter for the next st_buffer(). 
-  
-  # you have: 
-  # radius( (area(ogplot) + area(ogplot_w60mbuff)) ) - radius( area(ogplot) )
-  # looks correct!
-  size_of_perimiter<-sqrt(((area_of_plot+area_of_plot_with_buffer)*4046.86)/pi)-sqrt((area_of_plot)*4046.86/pi) 
-  
-  perimiters<-st_buffer(one_plot,size_of_perimiter,allow_holes=TRUE) # what is allow_holes doing here?
-  area_perimiter<-st_area(perimiters)/4046.86 # should be ~33 acres, unless allow_holes is doing something funky.
-  # the following looks to be returning a 1-element vector with CBI mean of the
-  # 33 acre plot, not the 10 acre perimeter plot. should leave fun=NULL to
-  # return a list of all raster values within the geometry. weights and
-  # normalizeWeights just make mean() return an area-weighted pixel
-  # mean--addresses edge pixels--but afaik doesn't change the output type.
-  perimiter_extract<-raster::extract(masked_cbi,st_as_sf(perimiters),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE) 
-  origional_extract<-raster::extract(masked_cbi,st_as_sf(buffer_plot),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-  # You can't recover the perimeter-plot-only mean CBI this way. 
-  perimiter_only<-as.numeric(((perimiter_extract[1]*area_perimiter)-(origional_extract[1]*area_of_plot_with_buffer))/(area_perimiter-area_of_plot_with_buffer)) 
-
-  compare_df[compare_df$plot_id==one_plot$FID_1,"buffer_method"]<-perimiter_only
-  
-}
-
-# imagine the og plot is all 2's and the perimeter plot is all 9's. This matrix
-# isn't scaled to the right dimensions, but that doesn't matter for this
-# example. Here, the perimeter plot area ==8 and the og plot area ==1.
-
-test_all <- matrix(c(9, 9, 9, 
-                     9, 2, 9, 
-                     9, 9, 9), 
-                   nrow = 3)
-# we know the mean of the perimeter plot should be 9. If you take the mean of the whole enchilada, you get ~8.22.
-mean_all <- mean(test_all, na.rm=TRUE)
-# doesn't matter if you have the plot areas correct, you can't get back to 9 with this kind of math. 
-((mean_all * 8) - (2 * 1)) / (8 - 1) 
-sum_all <- sum(test_all, na.rm=TRUE)
-((sum_all * 8) - (2 * 1)) / (8 - 1) 
-
-sqrt(mean((compare_df$origional_plot_cbi-compare_df$buffer_method)**2,na.rm=TRUE))
-
-
-#####
-
-### rf model
-
-elev_down<-raster("./processed_data/elev_down.tif")
-aspect_down<-raster("./processed_data/aspect_down.tif")
-TRI_down<-raster("./processed_data/TRI_down.tif")
-TPI_down<-raster("./processed_data/TPI_down.tif")
-slope_down<-raster("./processed_data/slope_down.tif")
-roads_distance<-raster("./processed_data/distance_to_road.tif")
-site_potential<-raster("./processed_data/lf_site_potential_new.tif")
-ppt<-raster("./processed_data/ppt.tif")
-tmin<-raster("./processed_data/tmin.tif")
-tmmx<-raster("./processed_data/tmmx.tif")
-th<-raster("./processed_data/th.tif")
-vpdmax<-raster("./processed_data/vpdmax.tif")
-rmax<-raster("./processed_data/rmax.tif")
-vs<-raster("./processed_data/vs.tif")
-fm100<-raster("./processed_data/fm100.tif")
-fm1000<-raster("./processed_data/fm1000.tif")
-
-
-
-masked_cbi<-raster("./processed_data/masked_raster.tif")
-
-validation_mask_cbi<-raster::mask(masked_cbi,st_as_sf(og_plots),inverse=TRUE)
-
-veg_treatments<-read_sf("./processed_data/vegetation_treatments_hpcc.shp")
-veg_treatments<-st_make_valid(veg_treatments)
-
-burn_perimiter<-read_sf("./processed_data/burn_perimiter.shp")
-
-## make empty raster to extract data into
-ycell<-masked_cbi@nrows
-xcell<-masked_cbi@ncols
-
-
-extract_df<-data.frame(lat=rep(seq(masked_cbi@extent[1],masked_cbi@extent[2],length.out=ycell),each=xcell),lon=rep(seq(masked_cbi@extent[3],masked_cbi@extent[4],length.out=ycell),times=xcell))
-
-
-
-extract_df$CBI<-raster::extract(masked_cbi,y=as.matrix(extract_df[,1:2]))
-extract_df$elev<-raster::extract(elev_down,y=as.matrix(extract_df[,1:2]))
-extract_df$aspect<-raster::extract(aspect_down,y=as.matrix(extract_df[,1:2]))
-extract_df$TRI<-raster::extract(TRI_down,y=as.matrix(extract_df[,1:2]))
-extract_df$TPI<-raster::extract(TPI_down,y=as.matrix(extract_df[,1:2]))
-extract_df$slope<-raster::extract(slope_down,y=as.matrix(extract_df[,1:2]))
-extract_df$road_distance<-raster::extract(roads_distance,y=as.matrix(extract_df[,1:2]))
-extract_df$env_potential<-raster::extract(site_potential,y=as.matrix(extract_df[,1:2]))
-extract_df$ppt<-raster::extract(ppt,y=as.matrix(extract_df[,1:2]))
-extract_df$tmin<-raster::extract(tmin,y=as.matrix(extract_df[,1:2]))
-extract_df$tmmx<-raster::extract(tmmx,y=as.matrix(extract_df[,1:2]))
-extract_df$th<-raster::extract(th,y=as.matrix(extract_df[,1:2]))
-extract_df$vs<-raster::extract(vs,y=as.matrix(extract_df[,1:2]))
-extract_df$vpdmax<-raster::extract(vpdmax,y=as.matrix(extract_df[,1:2]))
-extract_df$fm100<-raster::extract(fm100,y=as.matrix(extract_df[,1:2]))
-extract_df$fm1000<-raster::extract(fm1000,y=as.matrix(extract_df[,1:2]))
-extract_df$rmax<-raster::extract(rmax,y=as.matrix(extract_df[,1:2]))
-
-extract_df<-extract_df[extract_df$CBI!=0,]
-extract_df<-extract_df[extract_df$CBI!=9,]
-
-### site potentials are numerical codes but should be considered as factors
-extract_df$env_potential<-as.factor(paste("env_",extract_df$env_potential,sep=""))
+# convert to dataframe
+rf_dfs <- map(list(rasts_train, rasts_test), \(x) {
+  x %>%
+    # convert to sf points. only remove if all layers are NA.
+    as.points(na.all = TRUE) %>%
+    # convert to df, keeping point geoms as xy coords
+    as.data.frame(geom = "XY") %>%
+    # rename xy cols, even though they aren't exactly in lat + lon degrees
+    rename(lat = y, lon = x) %>%
+    # ensure site potential is a factor
+    mutate(esp = as_factor(esp)) %>%
+    # keep only complete cases
+    filter(complete.cases(.))
+}) %>%
+  set_names(c("rf_train", "rf_test"))
 
 
-predict_df<-extract_df[is.na(extract_df$CBI)==TRUE,]
-extract_df_full<-extract_df
-
-extract_df<-extract_df[complete.cases(extract_df),]
-
-#extract_df$CBI<-as.factor(extract_df$CBI)
-
-#cbi.task = makeRegrTask(data = extract_df, target = "CBI")
-#estimateTimeTuneRanger(cbi.task)
-
-#tuning<-tuneRanger(cbi.task)
-#tuning
-
-ranger_rf<-ranger(CBI~elev+aspect+TRI+TPI+slope+lat+lon+road_distance+env_potential+ppt+tmin+tmmx+th+vs+vpdmax+fm100+fm1000+rmax,extract_df,num.trees=1000,importance="impurity",mtry=5,min.node.size=2,sample.fraction=0.89)
+rf_sub <- rf_dfs$rf_train %>% slice_sample(n = 500) # replace after testing
+## fit model ####
+# takes ~ 2 hrs.
+ranger_rf <- ranger(
+  masked_cbi ~ elev + aspect + tri + tpi + slope + roads_distance + ppt + tmin +
+    tmmx + th + vpdmax + rmax + vs + fm100 + fm1000 + esp + lon + lat,
+  rf_sub, # replace after testing
+  # parameter tuning was previously completed with tuneRanger() Nate: check
+  importance="impurity",
+  num.trees = 10, # should be 1000, replace after testing
+  mtry = 2, # should be 5, replace after testing
+  min.node.size=2,
+  sample.fraction=0.89,
+  seed = 18003634377 # 1-800-DOD-GERS let's go Shohei!
+)
 ranger_rf
 
-### variable importance plot
+## variable importance plot ####
+var_imp_data <- data.frame(importance = ranger_rf$variable.importance) %>%
+  mutate(
+    # save row names as variable names
+    variable = fct_reorder(row.names(.), importance) %>%
+      # recode to make printable
+      fct_recode(TRI = "tri",
+                 TPI = "tpi",
+                 elevation = "elev",
+                 latitude = "lat",
+                 longitude = "lon",
+                 `road distance`  = "roads_distance",
+                 precipitation = "ppt",
+                 `minimum temperature` = "tmin",
+                 `maximum temperature` = "tmmx",
+                 `wind direction` = "th",
+                 `wind speed` = "vs",
+                 `max. vapor pressure deficit` = "vpdmax",
+                 `moisture, 100-hr` = "fm100",
+                 `moisture, 1000-hr` = "fm1000",
+                 `max. relative humidity` = "rmax",
+                 `environmental site potential` = "esp"
+      ),
+    Category = case_when( # nolint
+      row.names(.) %in% c("elev", "aspect", "tri", "tpi", "slope", "lat", "lon",
+                          "roads_distance") ~ "landscape",
+      row.names(.) %in% c("esp", "ppt", "tmin", "vpdmax") ~ "bioclimatic",
+      row.names(.) %in% c("tmmx", "th", "vs", "fm100", "fm1000", "rmax") ~
+        "weather",
+      .default = "other" # should not occur
+    )
+  )
+cbPalette <- c(
+  "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7"
+  )
+var_imp_plot <- var_imp_data %>%
+  ggplot(aes(x = importance, y = variable, fill = Category)) +
+  geom_bar(stat = "identity") +
+  theme_classic() +
+  theme(text = element_text(size = 15)) +
+  xlab("Importance (Gini index)") +
+  ylab("") +
+  scale_fill_manual(values = cbPalette)
+var_imp_plot
+# save figure
+ggsave("./figures/rf_importance.tif", units = 'in', width=10, height=8, dpi=600)
 
-var_imp_plot<-data.frame(importance=ranger_rf$variable.importance)
-var_imp_plot$variable<-row.names(var_imp_plot)
-var_imp_plot$category<-c("landscape","landscape","landscape","landscape","landscape","landscape","landscape","landscape","bioclimatic","bioclimatic","bioclimatic","weather","weather","weather","bioclimatic","weather","weather","weather")
+## extract predictions ####
+# predict CBI values for all points in the raster
+rf_dfs$rf_test$rf_predicted <- predict(ranger_rf, rf_dfs$rf_test)$predictions
+# build raster
+rf_preds_rast <- rf_dfs$rf_test %>%
+  select(lon, lat, rf_predicted) %>%
+  rast(crs = crs(cbi))
+# Nate: this is just predictions for the "testing" (=validation) plots. This is
+# efficient, but if you want to make a wall-to-wall map we need to generate
+# predictions over the full area. See:
+# mapview::mapview(rf_preds_rast) + mapview::mapview(validation_plots)
 
-var_imp_plot$variable<-fct_reorder(var_imp_plot$variable,var_imp_plot$importance)
-cbPalette <- c( "#E69F00", "#56B4E9", "#009E73", "#F0E442", "#0072B2", "#D55E00", "#CC79A7")
+# extract rf predicted CBI values for validation plots
+validation_plots$cbi_rf <- exact_extract(
+  rf_preds_rast,
+  validation_plots,
+  fun = "mean",
+  weights = "area",
+  progress = TRUE
+)
+# join to compare df
+compare <- left_join(compare,
+                     as.data.frame(validation_plots) %>%
+                       select(ID, cbi_rf),
+                     by = c("FID_validation" = "ID"))
+# plot
+plot(compare$cbi_rf, compare$cbi_validation,
+     xlab = "Random forest predicted CBI",
+     ylab = "Validation plot CBI")
 
-var_imp_plot$variable <- fct_recode(var_imp_plot$variable,"TRI"="TRI","TPI"="TPI","aspect"="aspect","slope"="slope","elev" = "elevation", "lat" = "lattitude","lon"="longitude","road_distance"="road distance","ppt"="precipitation","tmin"="minimum temperature","tmmx"="maximum temperature","th"="wind direction","vs"="wind speed","vpdmax"="maximum vapor pressure deficit","fm100"="moisture 100-hr","fm1000"="moisture 1000-hr","rmax"="maximum relative humidity","env_potential"="environmental potential")
+# spatial rf ####
+# make spatial rf dataframes
+rf_dfs_spatial <- map(rf_dfs, \(x) {
+  x %>%
+    # add copy of lat/lon to make sf
+    mutate(x = lon, y = lat) %>%
+    # make sf
+    st_as_sf(coords = c("x","y")) # dim = XYZ by default
+})
 
-variable_importance_plot<-ggplot(var_imp_plot,aes(x=importance,y=variable,fill=category))+geom_bar(stat="identity")+theme_classic()+theme(text=element_text(size=15))+xlab("Importance (Gini index)")+ylab("")+scale_fill_manual(values=cbPalette)+scale_y_discrete(labels=c("TPI","TRI","slope","wind direction","aspect","maximum temperature","moisture 100-hr fuel","maximum relative humidity","moisture 1000-hr fuel","wind speed","minimum temperature","maximum vpd","road distance","lattitude","environmental potential","precipitation","elevation","longitude"))
-variable_importance_plot
+rf_dat_spatial_sub <- slice_sample(rf_dfs_spatial$rf_train, n = 500) # replace after testing # nolint
+## fit global model ####
+# Nate: does it make sense to include lon + lat as predictors here?
+spatial_rf_model <- splmRF(
+  masked_cbi ~ elev + aspect + tri + tpi + slope + roads_distance + ppt + tmin +
+    tmmx + th + vpdmax + rmax + vs + fm100 + fm1000 + esp + lon + lat,
+  data = rf_dat_spatial_sub, # replace after testing
+  spcov_type = "gravity",
+  # leave 4 CPU cores free
+  local = list(parallel = TRUE, ncores = detectCores() - 4),
+  num.trees = 10, # remove after testing
+  mtry = 2, # should be 4, replace after testing
+  min.node.size = 2,
+  sample.fraction = 0.89
+)
+spatial_rf_model
 
-tiff(filename=("./figures/rf_importance.tif"),units='in',compression='lzw',width=10,height=8,res=300)
-variable_importance_plot
-dev.off()
+## extract global predictions ####
+# predict CBI values for all points in the raster
+# Nate: only took 17sec?
+rf_dfs$rf_test$rf_global_predicted <- predict(spatial_rf_model,
+                                              rf_dfs_spatial$rf_test)
+# build raster
+rf_global_preds_rast <- rf_dfs$rf_test %>%
+  select(lon, lat, rf_global_predicted) %>%
+  rast(crs = crs(cbi))
+# Nate: check if you want.
+# mapview::mapview(rf_global_preds_rast) + mapview::mapview(validation_plots)
 
-###############
+# extract rf predicted CBI values for validation plots
+validation_plots$cbi_rf_global <- exact_extract(
+  rf_global_preds_rast,
+  validation_plots,
+  fun = "mean",
+  weights = "area",
+  progress = TRUE
+)
+# join to compare df
+compare <- left_join(compare,
+                     as.data.frame(validation_plots) %>%
+                       select(ID, cbi_rf_global),
+                     by = c("FID_validation" = "ID"))
+# plot
+plot(compare$cbi_rf_global, compare$cbi_validation,
+     xlab = "Global spatial random forest predicted CBI",
+     ylab = "Validation plot CBI")
 
-coordinates<- data.frame(lat=extract_df$lat,lon=extract_df$lon)
+## fit local model ####
 
-extract_sf<-st_as_sf(extract_df,coords=c("lat","lon"))
-extract_sf$lat<-extract_df$lat
-extract_sf$lon<-extract_df$lon
+# # TODO remove the stuff below when you're done with it
+# predict_for_each_plot_spatial<-function(location){
+#
+#   predict_df<-data.frame(lat=rasterToPoints(raster::crop(site_potential,y=st_as_sf(location)))[,1],
+#                          lon=rasterToPoints(raster::crop(site_potential,y=st_as_sf(location)))[,2])
+#
+#   predict_df$elev<-raster::extract(elev_down,y=predict_df[,1:2])
+#   predict_df$aspect<-raster::extract(aspect_down,y=predict_df[,1:2])
+#   predict_df$TRI<-raster::extract(TRI_down,y=predict_df[,1:2])
+#   predict_df$TPI<-raster::extract(TPI_down,y=predict_df[,1:2])
+#   predict_df$slope<-raster::extract(slope_down,y=predict_df[,1:2])
+#   predict_df$road_distance<-raster::extract(roads_distance,y=predict_df[,1:2])
+#   predict_df$env_potential<-as.factor(raster::extract(site_potential,y=predict_df[,1:2]))
+#   predict_df$ppt<-raster::extract(ppt,y=as.matrix(predict_df[,1:2]))
+#   predict_df$tmin<-raster::extract(tmin,y=as.matrix(predict_df[,1:2]))
+#   predict_df$tmmx<-raster::extract(tmmx,y=as.matrix(predict_df[,1:2]))
+#   predict_df$th<-raster::extract(th,y=as.matrix(predict_df[,1:2]))
+#   predict_df$vs<-raster::extract(vs,y=as.matrix(predict_df[,1:2]))
+#   predict_df$vpdmax<-raster::extract(vpdmax,y=as.matrix(predict_df[,1:2]))
+#   predict_df$fm100<-raster::extract(fm100,y=as.matrix(predict_df[,1:2]))
+#   predict_df$fm1000<-raster::extract(fm1000,y=as.matrix(predict_df[,1:2]))
+#   predict_df$rmax<-raster::extract(rmax,y=as.matrix(predict_df[,1:2]))
+#
+#   predict_df$lat2<-predict_df$lat
+#   predict_df$lon2<-predict_df$lon
+#
+#
+#   predict_df<-predict_df[complete.cases(predict_df),]
+#
+#   predict_df<-st_as_sf(predict_df,coords=c("lat2","lon2"),crs=st_crs(site_potential))
+#
+#   #predict_df$modeled_values<-predict(ranger_rf,data=predict_df,na.rm=TRUE)$predictions
+#
+#
+#
+#   predict_df$modeled_values<-predict(spatial_rf_model,newdata=predict_df)
+#
+#   for_conversion<-data.frame(lat=predict_df$lat,lon=predict_df$lon,modeled_values=as.numeric(as.character(predict_df$modeled_values)))
+#
+#   predict_raster<-rasterFromXYZ(for_conversion,crs=crs(cbi))
+#
+#   mean_cbi<-raster::extract(predict_raster$modeled_values,st_as_sf(location),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
+#
+#
+#   return(mean_cbi)
+# }
+#
+#
+#
+# compare_df$spatial_rf_prediction<-NA
+# compare_df$rf_prediction<-NA
+# for (i in 1:nrow(compare_df)){
+#   print(i/nrow(compare_df)*100)
+#   one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
+#   compare_df$spatial_rf_prediction[i]=predict_for_each_plot_spatial(one_plot)
+#   compare_df$rf_prediction[i]=predict_for_each_plot(one_plot)
+#   }
+#
+# ## RMSE
+# sqrt(mean((compare_df$rf_prediction-compare_df$origional_plot_cbi)**2,na.rm=TRUE))
+# sqrt(mean((compare_df$spatial_rf_prediction-compare_df$origional_plot_cbi)**2,na.rm=TRUE))
+#
+# write.csv(compare_df,"./processed_data/larger_rf_model_predictions.csv")
+#
+# ## kriging ####
+#
+# library(snapKrig)
+#
+# compare_df$krigged_values<-NA
+#
+# for (i in 1:nrow(compare_df)){
+# #for (i in 1:5){
+#
+#
+# one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
+#
+# size_of_perimiter<-sqrt((200*4046.86)/pi)
+#
+# one_plot_buffer<-st_buffer(one_plot,size_of_perimiter)
+#
+# clipped_burn_raster<-raster::crop(cbi,one_plot_buffer)
+#
+# clipped_burn_raster<-raster::mask(clipped_burn_raster,st_as_sf(st_buffer(one_plot,60)),inverse=TRUE)
+#
+# clipped_burn_raster[clipped_burn_raster==0]<-1
+#
+# clipped_burn_raster[clipped_burn_raster==9]<-NA
+#
+# ### sk_fit fails when corner cells are NA. This sets it to 1 when it is NA.
+# ### Because corners are the fartest from the treatments this should have minimal
+# ### impact on predictions
+# if (is.na(clipped_burn_raster[1,1])==TRUE){clipped_burn_raster[1,1]<-1}
+# if (is.na(clipped_burn_raster[nrow(clipped_burn_raster),1])==TRUE){clipped_burn_raster[nrow(clipped_burn_raster),1]<-1}
+# if (is.na(clipped_burn_raster[1,ncol(clipped_burn_raster)])==TRUE){clipped_burn_raster[1,ncol(clipped_burn_raster)]<-1}
+# if (is.na(clipped_burn_raster[nrow(clipped_burn_raster),ncol(clipped_burn_raster)])==TRUE){clipped_burn_raster[nrow(clipped_burn_raster),ncol(clipped_burn_raster)]<-1}
+#
+#
+# clipped_burn_raster_sk<-sk(clipped_burn_raster)
+#
+#
+#
+# kriging_fit<-sk_fit(clipped_burn_raster_sk,n_max=3000)
+#
+#
+# krigged_final<-sk_cmean(clipped_burn_raster_sk,kriging_fit)
+# plot(krigged_final)
+#
+# krigged_final_raster<-sk_export(krigged_final)
+#
+# values<-extract(krigged_final_raster,one_plot)
+#
+# compare_df$krigged_values[i]<-mean(values$lyr.1)
+#
+#
+# }
+#
+#
+# sqrt(mean((compare_df$krigged_values-compare_df$origional_plot_cbi)**2,na.rm=TRUE))
+# write.csv(compare_df,"./processed_data/kriging_results.csv")
 
-spatial_rf_model<-splmRF(CBI~elev+aspect+TRI+TPI+slope+lat+lon+road_distance+env_potential+ppt+tmin+tmmx+th+vs+vpdmax+fm100+fm1000+rmax,data=extract_sf,spcov_type = "gravity",local=c(parallel=TRUE,ncores=16),mtry=4,min.node.size=2,sample.fraction=0.89)
+##### TODO clean up kriging above
 
+# fits a "local" spatial rf model for each validation plot, one at a time. map
+# this function over all of the FID's in the compare dataframe.
 
-## predicting for one plot at a time
-predict_for_each_plot<-function(location){
-  
-  predict_df<-data.frame(lat=rasterToPoints(raster::crop(site_potential,y=st_as_sf(location)))[,1],
-                         lon=rasterToPoints(raster::crop(site_potential,y=st_as_sf(location)))[,2])
-  
-  predict_df$elev<-raster::extract(elev_down,y=predict_df[,1:2])
-  predict_df$aspect<-raster::extract(aspect_down,y=predict_df[,1:2])
-  predict_df$TRI<-raster::extract(TRI_down,y=predict_df[,1:2])
-  predict_df$TPI<-raster::extract(TPI_down,y=predict_df[,1:2])
-  predict_df$slope<-raster::extract(slope_down,y=predict_df[,1:2])
-  predict_df$road_distance<-raster::extract(roads_distance,y=predict_df[,1:2])
-  predict_df$env_potential<-as.factor(raster::extract(site_potential,y=predict_df[,1:2]))
-  predict_df$ppt<-raster::extract(ppt,y=as.matrix(predict_df[,1:2]))
-  predict_df$tmin<-raster::extract(tmin,y=as.matrix(predict_df[,1:2]))
-  predict_df$tmmx<-raster::extract(tmmx,y=as.matrix(predict_df[,1:2]))
-  predict_df$th<-raster::extract(th,y=as.matrix(predict_df[,1:2]))
-  predict_df$vs<-raster::extract(vs,y=as.matrix(predict_df[,1:2]))
-  predict_df$vpdmax<-raster::extract(vpdmax,y=as.matrix(predict_df[,1:2]))
-  predict_df$fm100<-raster::extract(fm100,y=as.matrix(predict_df[,1:2]))
-  predict_df$fm1000<-raster::extract(fm1000,y=as.matrix(predict_df[,1:2]))
-  predict_df$rmax<-raster::extract(rmax,y=as.matrix(predict_df[,1:2]))
-  
-  
-  predict_df<-predict_df[complete.cases(predict_df),]
-  
-  #predict_df<-st_as_sf(predict_df,coords=c("lat","lon"),crs=st_crs(site_potential))
-  
-  #predict_df$lat<-rasterToPoints(raster::crop(site_potential,y=st_as_sf(location)))[,1]
-  #predict_df$lon=rasterToPoints(raster::crop(site_potential,y=st_as_sf(location)))[,2]
-  
-  predict_df$modeled_values<-predict(ranger_rf,data=predict_df,na.rm=TRUE)$predictions
-  #predict_df$modeled_values<-predict(spatial_rf_model,newdata=predict_df)
-  
-  for_conversion<-data.frame(lat=predict_df$lat,lon=predict_df$lon,modeled_values=as.numeric(predict_df$modeled_values))
-  
-  predict_raster<-rasterFromXYZ(for_conversion,crs=crs(masked_cbi))
-  
-  mean_cbi<-raster::extract(predict_raster$modeled_values,st_as_sf(location),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-  
+# anything that uses a SpatRaster cannot be run in parallel, so we need to
+# preprocess train and test data for each validation plot first.
 
-  return(mean_cbi)
+### build train and test data ####
+# makes train and test data for each plot
+build_train_test <- function (id) {
+  # id <- compare$FID_validation[1] # remove after testing
+  # grab one plot
+  one_plot <- validation_plots[validation_plots$FID_1 == id, ]
+
+  ## the following section relates to neighborhood size. Nate: let's review
+  ## this.
+  # # get size of ?? why 1200*4046?? I suppose this leads to the "arbitrary" 607
+  # # ha size noted in the manuscript?
+  # size_of_perimeter <- sqrt((1200 * 4046.86) / pi) #1243.297
+  one_plot_neighborhood <- st_buffer(one_plot, 1243) # hard-coding for speed
+  one_plot_target <- st_buffer(one_plot, 60) # the validation area
+  # st_area(one_plot_buffer)/10000 # this is ~578 hectares, ~1428 acres. not sure where 607 comes from
+
+  # Create a mask with 1 inside the polygon, NA outside.
+  # Nate: idk why, but rasterizing before masking is the only way I can get
+  # terra to mask precisely. otherwise I end up with weird extra cells on the
+  # boundary of the mask.
+  neighborhood_mask_layer <- rasterize(one_plot_neighborhood, rasts, field=1)
+  validation_mask_layer <- rasterize(one_plot_target, rasts, field=1)
+
+  # # Nate: masking instead of clipping. working with validation_mask_cbi, where
+  # # validation plots are already masked out. result should be a "donut" of
+  # # raster cells.
+  # masked_burn_raster <- mask(validation_mask_cbi, st_as_sf(one_plot_buffer))
+  # # note that with this method, ALL validation plot areas are masked out, not
+  # # just the focal validation plot area.
+  # mapview::mapview(masked_burn_raster) + mapview::mapview(validation_plots)
+
+  # # To "fix", could start with regular cbi raster and do masking for validation
+  # # plot again. though I'm not sure it's really a problem anyway.
+  # mapview::mapview(masked_burn_raster) + mapview::mapview(validation_plots)
+  # # actually, makes more sense to start with multiband rast so we don't have to
+  # # extract again--we can just convert to df. The radius is arbitrary anyway, so
+  # # we don't care about extract's ability to area-weight partially intersecting
+  # # cells.
+
+  # make "local" raster with crop (reduces memory overhead)
+  local <- rasts %>%
+    # mask out the target validation area
+    crop(neighborhood_mask_layer)
+
+  masked_raster <- local %>%
+    # if you don't want to drop cells from non-target validation areas, remove
+    # the masked_cbi column:
+    select(-masked_cbi) %>%
+    # mask out the target validation area
+    mask(validation_mask_layer, inverse = TRUE) %>%
+    # mask out everything beyond what is considered "local" training data
+    crop(neighborhood_mask_layer, mask = TRUE)
+  # # remove after testing
+  # mapview::mapview(masked_raster[[3]]) +
+  #   mapview::mapview(one_plot_neighborhood) +
+  #   mapview::mapview(one_plot_target)
+  # split training and testing data
+  train_df <- masked_raster %>%
+    # convert to points. drop where na
+    as.points() %>%
+    # convert to df, keeping point geoms as xy coords
+    as.data.frame(geom = "XY") %>%
+    # add lat/lon from y/xcols, even though they aren't exactly in lat + lon degrees
+    mutate(lat = y, lon = x) %>%
+    # keep only complete cases. will drop all validation cells automatically,
+    # since these cell values are NA in cbi_masked layer (unless that layer was
+    # previously dropped, then non-target validation areas are retained).
+    na.omit()
+    # Nate: there are also some edge cells that are being dropped, because the
+    # neighborhood extends over the edge of the burn scar for some plots. Not
+    # sure this would have been noticed at any point. I suppose it's okay that
+    # neighborhoods are different sizes for validation plots near the edge of
+    # the burn scar, but might mention this in the manuscript or supplement
+    # somewhere.
+
+  # validation plot raster mask, more precise
+  one_plot_mask <- rasterize(one_plot_target, rasts, touches = TRUE, field=1)
+  test_df <- local %>%
+    # definitely want to drop the masked_cbi layer so we retain the validation
+    # plot area when creating the df.
+    select(-masked_cbi) %>%
+    # keep ONLY the target validation area this time. using 30m buffer to ensure
+    # edge cells stay in at this point.
+    mask(one_plot_mask) %>%
+    # convert to points. only drop if all layers are NA.
+    as.points() %>%
+    # convert to df, keeping point geoms as xy coords
+    as.data.frame(geom = "XY") %>%
+    mutate(lat = y, lon = x)
+  # we should have all complete complete cases, and i want to know if we
+  # don't, so no final na.omit here.
+
+  # # remove after testing
+  # set.seed(123456) # for reproducibility
+  # train_df <- train_df %>%
+  #   slice_sample(n = 500)
+
+  # convert to sf
+  train_sf <- train_df %>%
+    st_as_sf(coords = c("x","y"), crs = st_crs(rasts))
+
+  test_sf <- test_df %>%
+    st_as_sf(coords = c("x", "y"), crs = st_crs(rasts))
+
+  return(list(
+    validation_FID = id,
+    train = train_sf,
+    test = test_sf
+  ))
 }
 
+# map function over all validation plot FIDs
+tictoc::tic()
+train_test_each_plot <- purrr::map(compare$FID_validation,
+                                   build_train_test,
+                                   .progress = TRUE)
+tictoc::toc() # ~30 mins for subsampled data, ~1hr for full data.
 
+# takes train and test sfs and returns prediction sf
+fit_local_spatial_rf <- function(train_test_list) {
 
-predict_for_each_plot_spatial<-function(location){
-  
-  predict_df<-data.frame(lat=rasterToPoints(raster::crop(site_potential,y=st_as_sf(location)))[,1],
-                         lon=rasterToPoints(raster::crop(site_potential,y=st_as_sf(location)))[,2])
-  
-  predict_df$elev<-raster::extract(elev_down,y=predict_df[,1:2])
-  predict_df$aspect<-raster::extract(aspect_down,y=predict_df[,1:2])
-  predict_df$TRI<-raster::extract(TRI_down,y=predict_df[,1:2])
-  predict_df$TPI<-raster::extract(TPI_down,y=predict_df[,1:2])
-  predict_df$slope<-raster::extract(slope_down,y=predict_df[,1:2])
-  predict_df$road_distance<-raster::extract(roads_distance,y=predict_df[,1:2])
-  predict_df$env_potential<-as.factor(raster::extract(site_potential,y=predict_df[,1:2]))
-  predict_df$ppt<-raster::extract(ppt,y=as.matrix(predict_df[,1:2]))
-  predict_df$tmin<-raster::extract(tmin,y=as.matrix(predict_df[,1:2]))
-  predict_df$tmmx<-raster::extract(tmmx,y=as.matrix(predict_df[,1:2]))
-  predict_df$th<-raster::extract(th,y=as.matrix(predict_df[,1:2]))
-  predict_df$vs<-raster::extract(vs,y=as.matrix(predict_df[,1:2]))
-  predict_df$vpdmax<-raster::extract(vpdmax,y=as.matrix(predict_df[,1:2]))
-  predict_df$fm100<-raster::extract(fm100,y=as.matrix(predict_df[,1:2]))
-  predict_df$fm1000<-raster::extract(fm1000,y=as.matrix(predict_df[,1:2]))
-  predict_df$rmax<-raster::extract(rmax,y=as.matrix(predict_df[,1:2]))
-  
-  predict_df$lat2<-predict_df$lat
-  predict_df$lon2<-predict_df$lon
-  
-  
-  predict_df<-predict_df[complete.cases(predict_df),]
-    
-  predict_df<-st_as_sf(predict_df,coords=c("lat2","lon2"),crs=st_crs(site_potential))
+  train_sf <- train_test_list$train
+  test_sf <- train_test_list$test
 
-  #predict_df$modeled_values<-predict(ranger_rf,data=predict_df,na.rm=TRUE)$predictions
-  
-  
-  
-  predict_df$modeled_values<-predict(spatial_rf_model,newdata=predict_df)
-  
-  for_conversion<-data.frame(lat=predict_df$lat,lon=predict_df$lon,modeled_values=as.numeric(as.character(predict_df$modeled_values)))
-  
-  predict_raster<-rasterFromXYZ(for_conversion,crs=crs(masked_cbi))
-  
-  mean_cbi<-raster::extract(predict_raster$modeled_values,st_as_sf(location),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-  
-  
-  return(mean_cbi)
-}
+  # Nate: I get that part of the exercise is to see what happens when we don't
+  # have to approximate the spatial structure of the data. But when/where is
+  # this approximation happening in the global spatial rf model? It looks like
+  # its in the splm() help, and IIRC the approximation methods kick in when n >
+  # 5000 **OR** when "local=" parameters are set. Is that why we have a
+  # "neighborhood" of the set size? It gives a neighborhood of ~4000 obs. If
+  # this is correct, and I think it is, then we might be accidentally triggering
+  # an approximation method by setting "local=" parameters here ("...If a list
+  # is provided, the following arguments detail the big data approximation:..").
+  # It seems that the parallelization options apply parallel processing across
+  # the groups used in the approximation methods, and we don't want
+  # approximation methods here, so there should be nothing to parallelize. I'm
+  # setting local=FALSE here just to be double sure, though it should default to
+  # that based on the sample size.
+  # tictoc::tic()
+  local_spatial_rf_model <- splmRF(
+    cbi ~ elev + aspect + tri + tpi + slope + roads_distance + ppt +
+      tmin + tmmx + th + vpdmax + rmax + vs + fm100 + fm1000 + esp + lon + lat,
+    data = train_sf,
+    spcov_type = "exponential", # this is the default already.
+    local = FALSE, # no spatial approximation!
+    mtry = 4,
+    min.node.size = 2,
+    sample.fraction = 0.89)
+  # tictoc::toc() # 5 minutes to fit one model.
 
+  # predict for the validation plot. for speed, just focus on the pixels in the
+  # validation plot area.
 
+  # tictoc::tic()
+  predictions <- predict(local_spatial_rf_model, newdata = test_sf)
+  # tictoc::toc() # 11 seconds to predict one validation plot
 
-compare_df$spatial_rf_prediction<-NA
-compare_df$rf_prediction<-NA
-for (i in 1:nrow(compare_df)){
-  print(i/nrow(compare_df)*100)
-  one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
-  compare_df$spatial_rf_prediction[i]=predict_for_each_plot_spatial(one_plot)
-  compare_df$rf_prediction[i]=predict_for_each_plot(one_plot)
-  }
+  # Nate: if we were to cut a corner, we could just return the mean at this
+  # stage instead of converting back to rast and taking the area-weighted cell
+  # means with exact_extract(). Otherwise we just return the predictions as a
+  # vector here.
 
-## RMSE
-sqrt(mean((compare_df$rf_prediction-compare_df$origional_plot_cbi)**2,na.rm=TRUE))
-sqrt(mean((compare_df$spatial_rf_prediction-compare_df$origional_plot_cbi)**2,na.rm=TRUE))
-
-write.csv(compare_df,"./processed_data/larger_rf_model_predictions.csv")
-
-##### Kriging
-
-library(snapKrig)
-
-compare_df$krigged_values<-NA
-
-for (i in 1:nrow(compare_df)){
-#for (i in 1:5){
-    
-  
-one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
-
-size_of_perimiter<-sqrt((200*4046.86)/pi)
-
-one_plot_buffer<-st_buffer(one_plot,size_of_perimiter)
-
-clipped_burn_raster<-raster::crop(masked_cbi,one_plot_buffer)
-
-clipped_burn_raster<-raster::mask(clipped_burn_raster,st_as_sf(st_buffer(one_plot,60)),inverse=TRUE)
-
-clipped_burn_raster[clipped_burn_raster==0]<-1
-
-clipped_burn_raster[clipped_burn_raster==9]<-NA
-
-### sk_fit fails when corner cells are NA. This sets it to 1 when it is NA. Because corners are the fartest from the treatments this should have minimal impact on predictions
-if (is.na(clipped_burn_raster[1,1])==TRUE){clipped_burn_raster[1,1]<-1}
-if (is.na(clipped_burn_raster[nrow(clipped_burn_raster),1])==TRUE){clipped_burn_raster[nrow(clipped_burn_raster),1]<-1}
-if (is.na(clipped_burn_raster[1,ncol(clipped_burn_raster)])==TRUE){clipped_burn_raster[1,ncol(clipped_burn_raster)]<-1}
-if (is.na(clipped_burn_raster[nrow(clipped_burn_raster),ncol(clipped_burn_raster)])==TRUE){clipped_burn_raster[nrow(clipped_burn_raster),ncol(clipped_burn_raster)]<-1}
-
-
-clipped_burn_raster_sk<-sk(clipped_burn_raster)
-
-
-
-kriging_fit<-sk_fit(clipped_burn_raster_sk,n_max=3000)
-
-
-krigged_final<-sk_cmean(clipped_burn_raster_sk,kriging_fit)
-plot(krigged_final)
-
-krigged_final_raster<-sk_export(krigged_final)
-
-values<-extract(krigged_final_raster,one_plot)
-
-compare_df$krigged_values[i]<-mean(values$lyr.1)
-
+  # mean(predictions)
+  return(list(
+    validation_FID = train_test_list$validation_FID,
+    predictions = predictions))
 
 }
 
+# map this over the list of training and testing data to fit models and extract
+# predictions
+tictoc::tic()
+all_preds <- purrr::map(train_test_each_plot,
+                        fit_local_spatial_rf,
+                        .progress = TRUE)
+tictoc::toc() # ~7 mins for subsampled (n=500) training data.
 
-sqrt(mean((compare_df$krigged_values-compare_df$origional_plot_cbi)**2,na.rm=TRUE))
-write.csv(compare_df,"./processed_data/kriging_results.csv")
-
-##### spatial rf 
-
-local_spatial_rf<-c()
-
-for (i in 1:nrow(compare_df)){
-
-  one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
-  
-  size_of_perimiter<-sqrt((1200*4046.86)/pi)
-  
-  one_plot_buffer<-st_buffer(one_plot,size_of_perimiter)
-  
-  clipped_burn_raster<-raster::crop(validation_mask_cbi,st_as_sf(one_plot_buffer))
-  clipped_burn_raster[clipped_burn_raster==0]<-1
-  clipped_burn_raster[clipped_burn_raster==9]<-NA
-
-  training_df<-as.data.frame(rasterToPoints(clipped_burn_raster))
-  
-  training_df$CBI<-training_df$masked_raster
-  training_df$elev<-raster::extract(elev_down,y=training_df[,1:2])
-  training_df$aspect<-raster::extract(aspect_down,y=training_df[,1:2])
-  training_df$TRI<-raster::extract(TRI_down,y=training_df[,1:2])
-  training_df$TPI<-raster::extract(TPI_down,y=training_df[,1:2])
-  training_df$slope<-raster::extract(slope_down,y=training_df[,1:2])
-  training_df$road_distance<-raster::extract(roads_distance,y=training_df[,1:2])
-  training_df$env_potential<-as.factor(raster::extract(site_potential,y=training_df[,1:2]))
-  training_df$ppt<-raster::extract(ppt,y=as.matrix(training_df[,1:2]))
-  training_df$tmin<-raster::extract(tmin,y=as.matrix(training_df[,1:2]))
-  training_df$tmmx<-raster::extract(tmmx,y=as.matrix(training_df[,1:2]))
-  training_df$vpdmax<-raster::extract(vpdmax,y=as.matrix(training_df[,1:2]))
-
-  training_df$lat<-training_df$x
-  training_df$lon<-training_df$y
-  
-  training_df<-training_df[complete.cases(training_df),]
-  
-  training_df<-st_as_sf(training_df,coords=c("x","y"),crs=st_crs(site_potential))
-  
+# # map this over the list of training and testing data to fit models and extract
+# # predictions, now in parallel
+# tictoc::tic()
+# plan(multisession, workers = n_cores)
+# all_preds <- purrr::map(train_test_each_plot,
+#                         fit_local_spatial_rf,
+#                         .progress = TRUE)
+# tictoc::toc()
 
 
-  
-  spatial_rf_model<-splmRF(CBI~elev+aspect+TRI+TPI+slope+road_distance+env_potential+lat+lon+ppt+tmin+vpdmax,data=training_df,spcov_type = "exponential",local=c(parallel=TRUE,ncores=8),mtry=4,min.node.size=2,sample.fraction=0.89)
-  
-  #
-  
-  predict_df<-data.frame(lat=rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,1],
-                         lon=rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,2])
-  
-  predict_df$elev<-raster::extract(elev_down,y=predict_df[,1:2])
-  predict_df$aspect<-raster::extract(aspect_down,y=predict_df[,1:2])
-  predict_df$TRI<-raster::extract(TRI_down,y=predict_df[,1:2])
-  predict_df$TPI<-raster::extract(TPI_down,y=predict_df[,1:2])
-  predict_df$slope<-raster::extract(slope_down,y=predict_df[,1:2])
-  predict_df$road_distance<-raster::extract(roads_distance,y=predict_df[,1:2])
-  predict_df$env_potential<-as.factor(raster::extract(site_potential,y=predict_df[,1:2]))
-  predict_df$ppt<-raster::extract(ppt,y=as.matrix(predict_df[,1:2]))
-  predict_df$tmin<-raster::extract(tmin,y=as.matrix(predict_df[,1:2]))
-  predict_df$tmmx<-raster::extract(tmmx,y=as.matrix(predict_df[,1:2]))
-  predict_df$vpdmax<-raster::extract(vpdmax,y=as.matrix(predict_df[,1:2]))
-
-  g<-predict_df
-  
-  predict_df$lat2<-predict_df$lat
-  predict_df$lon2<-predict_df$lon
-  
-  predict_df<-predict_df[complete.cases(predict_df),]
-  
-  predict_df<-st_as_sf(predict_df,coords=c("lat2","lon2"),crs=st_crs(site_potential))
-  
-
-  #predict_df$modeled_values<-predict(ranger_rf,data=predict_df,na.rm=TRUE)$predictions
-  predict_df$modeled_values<-predict(spatial_rf_model,newdata=predict_df)
-  
-  for_conversion<-data.frame(lat=predict_df$lat,lon=predict_df$lon,modeled_values=as.numeric(predict_df$modeled_values))
-  
-  predict_raster<-rasterFromXYZ(for_conversion,crs=crs(masked_cbi))
-  
-  mean_cbi<-raster::extract(predict_raster$modeled_values,st_as_sf(one_plot),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-  
-  local_spatial_rf[i]<-mean_cbi
-  
-  print(i)
+get_mean_predictions <- function(preds_vec, train_test_each_plot) {
+  # get id
+  id <- train_test_each_plot$validation_FID
+  # get test_sf
+  test_sf <- train_test_each_plot$test
+  # add predictions to test_sf
+  test_sf$cbi_local_spatial_rf <- preds_vec
+  # convert predictions to raster and extract by exact plot polygon
+  predict_rast <- test_sf %>%
+    select(lon, lat, cbi_local_spatial_rf) %>%
+    # convert to rast
+    rast(crs = crs(cbi))
+    # extract
+  predict_mean <- exact_extract(predict_rast,
+                                one_plot,
+                                fun = "mean",
+                                weights = "area")
+  # final output is the mean cbi value of the validation plot
+  return(list(id = id, predictions = predict_mean))
 }
 
+tictoc::tic()
+local_spatial_results <- map(compare$FID_validation, fit_local_spatial_rf)
+tictoc::toc() # 24 minutes with "test" subset of 500 obs, 1 core.
+# this has taken multiple days
+
+
+
+# now, parallelize
+install.packages("furrr")
+library(furrr)
+tictoc::tic()
+# get n cores
+n_cores <- parallel::detectCores() - 4 # leave 4 cores free
+# set up parallel processing
+plan(multisession, workers = n_cores)
+# fit local spatial rf model for each validation plot in parallel
+local_spatial_results <- future_map(
+  compare$FID_validation,
+  fit_local_spatial_rf,
+  .options = furrr_options(packages = c("terra",
+                                         "sf",
+                                         "tidyterra",
+                                         "tidyverse",
+                                         "exactextractr"),
+                           seed = 1548966)
+)
+tictoc::toc() # xx minutes with "test" subset of 500 obs, 16 cores.
+
+# test furrr and terra
+testlist <- list("test1" = 1)
+
+test <- future_map(
+  testlist,
+  function(x) {
+    # must write rast to and pass filename to future_map
+    vs <- rast("./processed_data/vs.tif")
+    # this is a test function that uses terra::mask
+    y <- mask(vs, st_as_sf(validation_plots[x, ]), inverse = TRUE)
+    writeRaster(y,
+              filename = paste0("./processed_data/test_", x, ".tif"),
+              overwrite = TRUE)
+  },
+  .options = furrr_options(
+    packages = c("terra", "sf", "tidyterra", "tidyverse", "exactextractr"),
+    seed = 155)
+)
+library(tidyverse)
+rast("./processed_data/test_1.tif") %>% plot
 
 compare_df$local_spatial_rf_no_weather<-local_spatial_rf
 
@@ -532,17 +764,17 @@ local_spatial_rf_weather<-data.frame()
 for (i in 1:nrow(compare_df)){
 
   one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
-  
+
   size_of_perimiter<-sqrt((1200*4046.86)/pi)
-  
+
   one_plot_buffer<-st_buffer(one_plot,size_of_perimiter)
-  
+
   clipped_burn_raster<-raster::crop(validation_mask_cbi,st_as_sf(one_plot_buffer))
   clipped_burn_raster[clipped_burn_raster==0]<-1
   clipped_burn_raster[clipped_burn_raster==9]<-NA
-  
+
   training_df<-as.data.frame(rasterToPoints(clipped_burn_raster))
-  
+
   training_df$CBI<-training_df$masked_raster
   training_df$elev<-raster::extract(elev_down,y=training_df[,1:2])
   training_df$aspect<-raster::extract(aspect_down,y=training_df[,1:2])
@@ -560,25 +792,25 @@ for (i in 1:nrow(compare_df)){
   training_df$fm100<-raster::extract(fm100,y=as.matrix(training_df[,1:2]))
   training_df$fm1000<-raster::extract(fm1000,y=as.matrix(training_df[,1:2]))
   training_df$rmax<-raster::extract(rmax,y=as.matrix(training_df[,1:2]))
-  
-  
-  
-  
+
+
+
+
   training_df$lat<-as.data.frame(rasterToPoints(clipped_burn_raster))[,1]
   training_df$lon<-as.data.frame(rasterToPoints(clipped_burn_raster))[,2]
-  
+
   training_df<-training_df[complete.cases(training_df),]
 
   training_df<-st_as_sf(training_df,coords=c("x","y"),crs=st_crs(site_potential))
-  
-    
+
+
   spatial_rf_model<-splmRF(CBI~elev+aspect+TRI+TPI+slope+road_distance+env_potential+lat+lon+ppt+tmin+tmmx+th+vs+vpdmax+fm100+fm1000+rmax,data=training_df,spcov_type = "exponential",local=c(parallel=TRUE,ncores=15),mtry=4,min.node.size=2,sample.fraction=0.89)
-  
+
   #
-  
+
   predict_df<-data.frame(lat=rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,1],
                          lon=rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,2])
-  
+
   predict_df$elev<-raster::extract(elev_down,y=predict_df[,1:2])
   predict_df$aspect<-raster::extract(aspect_down,y=predict_df[,1:2])
   predict_df$TRI<-raster::extract(TRI_down,y=predict_df[,1:2])
@@ -595,32 +827,32 @@ for (i in 1:nrow(compare_df)){
   predict_df$fm100<-raster::extract(fm100,y=as.matrix(predict_df[,1:2]))
   predict_df$fm1000<-raster::extract(fm1000,y=as.matrix(predict_df[,1:2]))
   predict_df$rmax<-raster::extract(rmax,y=as.matrix(predict_df[,1:2]))
-  
+
   predict_df<-predict_df[complete.cases(predict_df),]
 
   predict_df$lat2<-predict_df$lat
   predict_df$lon2<-predict_df$lon
-  
-    
-  predict_df<-st_as_sf(predict_df,coords=c("lat2","lon2"),crs=st_crs(site_potential))
-  
 
-  
+
+  predict_df<-st_as_sf(predict_df,coords=c("lat2","lon2"),crs=st_crs(site_potential))
+
+
+
   #predict_df$modeled_values<-predict(ranger_rf,data=predict_df,na.rm=TRUE)$predictions
   predict_df$modeled_values<-predict(spatial_rf_model,newdata=predict_df)
-  
+
   for_conversion<-data.frame(lat=predict_df$lat,lon=predict_df$lon,modeled_values=as.numeric(predict_df$modeled_values))
-  
-  predict_raster<-rasterFromXYZ(for_conversion,crs=crs(masked_cbi))
-  
+
+  predict_raster<-rasterFromXYZ(for_conversion,crs=crs(cbi))
+
   mean_cbi<-raster::extract(predict_raster$modeled_values,st_as_sf(one_plot),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-  
+
   output<-data.frame(plot_id=one_plot$FID_1,local_spatial_rf_weather=mean_cbi)
-  
+
   local_spatial_rf_weather<-rbind(local_spatial_rf_weather,output)
-  
+
   print(i)
-  
+
 }
 
 compare_df<-merge(compare_df,local_spatial_rf_weather,by="plot_id")
@@ -629,7 +861,7 @@ compare_df$local_spatial_rf_with_weather<-compare_df$local_spatial_rf_weather
 
 write.csv(compare_df,"./processed_data/both_local_spatials.csv")
 
-####################### clustering based matching 
+####################### clustering based matching
 
 ## remove the treated and validation plots
 veg_treatments<-read_sf("./processed_data/vegetation_treatments_hpcc_new.shp")
@@ -640,7 +872,7 @@ gridded_plots<-st_transform(gridded_plots,st_crs(CBI))
 gridded_plots_2<-st_difference(gridded_plots,st_union(veg_treatments))
 
 
-gridded_plots_3<-st_difference(gridded_plots_2,st_union(st_buffer(validation_plots,60)))
+gridded_plots_3<-st_difference(gridded_plots_2,st_union(st_buffer(validation_and_control_plots,60)))
 
 mapview(gridded_plots_3)
 
@@ -701,34 +933,34 @@ knn_rmse<-c()
 knn_mean_diff<-c()
 
 for (i in 1:5000){
-  
+
   compare_df_sample<-compare_df[sample(nrow(compare_df), nrow(compare_df),replace = TRUE), ]
-  
+
   traditional_controls_rmse[i]<-sqrt(mean((compare_df_sample$control_plot_cbi-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
   traditional_controls_mean_diff[i]<-mean(compare_df_sample$control_plot_cbi-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-  
+
   perimiter_rmse[i]<-sqrt(mean((compare_df_sample$buffer_method-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
   perimiter_mean_diff[i]<-mean(compare_df_sample$buffer_method-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-  
+
   rf_rmse[i]<-sqrt(mean((compare_df_sample$rf_prediction-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
   rf_mean_diff[i]<-mean(compare_df_sample$rf_prediction-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-  
+
   sp_rf_rmse[i]<-sqrt(mean((compare_df_sample$spatial_rf_prediction-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
   sp_rf_mean_diff[i]<-mean(compare_df_sample$spatial_rf_prediction-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-  
+
   krig_rmse[i]<-sqrt(mean((compare_df_sample$krigged_values-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
   krig_mean_diff[i]<-mean(compare_df_sample$krigged_values-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-  
+
   local_spatial_rf_rmse[i]<-sqrt(mean((compare_df_sample$local_spatial_rf_no_weather-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
   local_spatial_rf_mean_diff[i]<-mean(compare_df_sample$local_spatial_rf_no_weather-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-  
+
   local_spatial_rf_weather_rmse[i]<-sqrt(mean((compare_df_sample$local_spatial_rf_with_weather.local_spatial_rf_weather-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
   local_spatial_rf_weather_mean_diff[i]<-mean(compare_df_sample$local_spatial_rf_with_weather.local_spatial_rf_weather-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-  
+
   knn_rmse[i]<-sqrt(mean((compare_df_sample$knn-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
   knn_mean_diff[i]<-mean(compare_df_sample$knn-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-  
-  
+
+
 }
 
 
