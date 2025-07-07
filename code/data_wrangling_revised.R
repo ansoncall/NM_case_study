@@ -30,7 +30,7 @@ hpcc <- read_sf("./raw_data/fire_perimeters/Perimeters.shp") %>%
   st_transform(crs = proj)
 
 # now that we have polygons, use them to clip the cbi raster
-cbi <- crop(cbi_fullextent, hpcc)
+cbi <- crop(cbi_full_extent, hpcc)
 
 ## vegetation treatments ####
 veg_treatments <- read_sf("./raw_data/NMVeg.gdb") %>%
@@ -129,9 +129,8 @@ writeRaster(masked_cbi, "./processed_data/masked_raster.tif", overwrite = TRUE)
 write_sf(hpcc, dsn = "./processed_data/burn_perimeter.shp")
 
 ## vegetation treatments ####
-st_write(veg_treatments,
-         dsn = "./processed_data/vegetation_treatments_hpcc_new.shp",
-         append = FALSE)
+write_sf(veg_treatments,
+         dsn = "./processed_data/vegetation_treatments_hpcc_new.shp")
 
 ## roads ####
 # cropped and reprojected road segments
