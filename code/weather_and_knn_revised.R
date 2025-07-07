@@ -135,8 +135,8 @@ gridded_points <- st_sample(st_buffer(burn_perimeter, dist = -113.49694),
 gridded_plots <- st_buffer(gridded_points, dist = 113.49694) %>% st_as_sf
 
 # Nate: check
-mapview::mapview(burn_perimeter) +
-  mapview::mapview(gridded_plots, color = "red", alpha = 0.5) # nolint
+# mapview::mapview(burn_perimeter) +
+#   mapview::mapview(gridded_plots, color = "red", alpha = 0.5) # nolint
 
 ## load additional data ####
 # topography
