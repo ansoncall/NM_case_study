@@ -17,6 +17,7 @@ library(conflicted)
 
 # set options ####
 conflicts_prefer(dplyr::filter)
+testing <- TRUE # reduces sample size for testing purposes.
 
 #load data ####
 ## composite burn index (CBI) raster ####
@@ -192,20 +193,25 @@ plot(compare$cbi_perimeter, compare$cbi_validation,
      ylab = "Validation plot")
 
 
-
-
 # kriging ####
 # takes a validation plot, crops the cbi raster to its neighborhood and masks
 # out the plot itself, and applies kriging.
 krig_plot <- function(validation_plot_id) {
   # grab a plot based on id
+  # one_plot <- validation_plots %>% filter(FID_1 == 18) # for testing # nolint
   # TODO fix "no visible binding"
   one_plot <- validation_plots %>% filter(FID_1 == validation_plot_id) # nolint
-
   # Nate, this was the original size. Could change or leave it, just make sure
   # its documented in the paper correctly. Hardcoding for speed here.
   # size_of_neighborhood <- sqrt((200*4046.86)/pi) # nolint
-  one_plot_buffer <- st_buffer(one_plot, 507)
+  if (testing == TRUE) {
+    # for testing, use a smaller neighborhood. this runs in ~10 minutes.
+    buffer_size <- 200
+  } else {
+    buffer_size <- 507 # this runs in ~5 hrs.
+  }
+
+  one_plot_buffer <- st_buffer(one_plot, buffer_size)
 
   clipped_burn_raster <- crop(cbi, one_plot_buffer) %>%
     mask(st_as_sf(st_buffer(one_plot, 60)), inverse = TRUE)
@@ -213,6 +219,7 @@ krig_plot <- function(validation_plot_id) {
   # sk_fit fails when corner cells are NA. This sets it to 1 when it is NA.
   # Because corners are the farthest from the treatments this should have
   # minimal impact on predictions
+
   corner_indices <- list(
     c(1, 1),
     c(nrow(clipped_burn_raster), 1),
@@ -226,15 +233,32 @@ krig_plot <- function(validation_plot_id) {
     }
   }
 
-  # apply kriging
-  clipped_burn_raster_sk <- sk(clipped_burn_raster)
-  kriging_fit <- sk_fit(clipped_burn_raster_sk, n_max = 3000, quiet = TRUE)
-  kriged_final <- sk_cmean(clipped_burn_raster_sk, kriging_fit)
-
-  # build raster and extract values
-  kriged_final_raster <- sk_export(kriged_final)
-
-  out <- exact_extract(kriged_final_raster, one_plot, fun = "mean")
+  # Nate: it also fails when all non-NA cells have the same value, which can
+  # happen easily when the neighborhood size is small. here, we check to see if
+  # that is the case, and if so we skip over kriging and just assign that
+  # singular value as the prediction.
+  vals <- values(clipped_burn_raster, mat = FALSE)
+  vals <- vals[!is.na(vals)]
+  all_same <- length(unique(vals)) == 1
+  if (all_same) {
+    # if all values are the same, just return that value
+    message(
+      sprintf(
+        c("[FID #%d] Warning: No variability in CBI.",
+          " Returning uniform predictions."),
+        validation_plot_id
+      )
+    )
+    out <- vals[[1]]
+  } else {
+    # apply kriging
+    clipped_burn_raster_sk <- sk(clipped_burn_raster)
+    kriging_fit <- sk_fit(clipped_burn_raster_sk, n_max = 3000, quiet = TRUE)
+    kriged_final <- sk_cmean(clipped_burn_raster_sk, kriging_fit)
+    # build raster and extract values
+    kriged_final_raster <- sk_export(kriged_final)
+    out <- exact_extract(kriged_final_raster, one_plot, fun = "mean")
+  }
 
   # return
   list(
@@ -243,13 +267,20 @@ krig_plot <- function(validation_plot_id) {
   )
 }
 
-# apply. this takes about 5 h to run.
+# apply. t
 krig_results <- map(validation_plots$FID_1, krig_plot, .progress = TRUE) %>%
   bind_rows() %>%
-  rename(plot_id = id, cbi_krig)
+  rename(plot_id = id, cbi_krig = cbi_krig)
 
-# write out
+# write out (if desired)
 write.csv(krig_results, "./processed_data/kriging_results.csv")
+
+# join to compare df
+compare <- left_join(compare,
+                     krig_results %>% mutate(plot_id = as.character(plot_id)),
+                     by = c("FID_validation" = "plot_id")) %>%
+  # rename for clarity
+  rename(cbi_krigged = cbi_krig)
 
 # cluster based matching ####
 # TODO ppt was missing from gridded plots. Could fix this in weather_and_knn
@@ -320,128 +351,9 @@ compare <- left_join(compare,
                      by = c("FID_validation" = "ID")) %>%
   rename(geometry = geometry.x,
          matched_plot_geometry = geometry.y)
-compare
+compare %>% names
 # write out
-write.csv(compare, "./processed_data/compare_results.csv")
-
-# RMSE and plots ####
-# TODO: tidy or maybe move to another script?
-# nolint start
-#
-traditional_controls_rmse<-c()
-traditional_controls_mean_diff<-c()
-#
-perimiter_rmse<-c()
-perimiter_mean_diff<-c()
-#
-rf_rmse<-c()
-rf_mean_diff<-c()
-#
-sp_rf_rmse<-c()
-sp_rf_mean_diff<-c()
-#
-krig_rmse<-c()
-krig_mean_diff<-c()
-#
-local_spatial_rf_rmse<-c()
-local_spatial_rf_mean_diff<-c()
-#
-local_spatial_rf_weather_rmse<-c()
-local_spatial_rf_weather_mean_diff<-c()
-#
-knn_rmse<-c()
-knn_mean_diff<-c()
-
-for (i in 1:5000){
-
-  compare_df_sample<-compare_df[sample(nrow(compare_df), nrow(compare_df),replace = TRUE), ]
-
-  traditional_controls_rmse[i]<-sqrt(mean((compare_df_sample$control_plot_cbi-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
-  traditional_controls_mean_diff[i]<-mean(compare_df_sample$control_plot_cbi-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-
-  perimiter_rmse[i]<-sqrt(mean((compare_df_sample$buffer_method-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
-  perimiter_mean_diff[i]<-mean(compare_df_sample$buffer_method-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-
-  rf_rmse[i]<-sqrt(mean((compare_df_sample$rf_prediction-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
-  rf_mean_diff[i]<-mean(compare_df_sample$rf_prediction-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-
-  sp_rf_rmse[i]<-sqrt(mean((compare_df_sample$spatial_rf_prediction-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
-  sp_rf_mean_diff[i]<-mean(compare_df_sample$spatial_rf_prediction-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-
-  krig_rmse[i]<-sqrt(mean((compare_df_sample$krigged_values-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
-  krig_mean_diff[i]<-mean(compare_df_sample$krigged_values-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-
-  local_spatial_rf_rmse[i]<-sqrt(mean((compare_df_sample$local_spatial_rf_no_weather-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
-  local_spatial_rf_mean_diff[i]<-mean(compare_df_sample$local_spatial_rf_no_weather-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-
-  local_spatial_rf_weather_rmse[i]<-sqrt(mean((compare_df_sample$local_spatial_rf_with_weather.local_spatial_rf_weather-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
-  local_spatial_rf_weather_mean_diff[i]<-mean(compare_df_sample$local_spatial_rf_with_weather.local_spatial_rf_weather-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-
-  knn_rmse[i]<-sqrt(mean((compare_df_sample$knn-compare_df_sample$origional_plot_cbi)**2,na.rm=TRUE))
-  knn_mean_diff[i]<-mean(compare_df_sample$knn-compare_df_sample$origional_plot_cbi,na.rm=TRUE)
-
-
-}
-
-
-
-graphing_comparison<-data.frame(model_type=c("practitioner selected plots","perimeter method","random forest","spatial random forest","kriging","local spatial random forest without weather","local spatial random forest","propensity score matching"),mean_rmse=c(mean(traditional_controls_rmse),mean(perimiter_rmse),mean(rf_rmse,na.rm=TRUE),mean(sp_rf_rmse,na.rm=TRUE),mean(krig_rmse),mean(local_spatial_rf_rmse),mean(local_spatial_rf_weather_rmse),mean(knn_rmse)),lower_ci=c(quantile(traditional_controls_rmse,0.025),quantile(perimiter_rmse,0.025),quantile(rf_rmse,0.025,na.rm=TRUE),quantile(sp_rf_rmse,0.025,na.rm=TRUE),quantile(krig_rmse,0.025),quantile(local_spatial_rf_rmse,0.025,na.rm=TRUE),quantile(local_spatial_rf_weather_rmse,0.025,na.rm=TRUE),quantile(knn_rmse,0.025)),upper_ci=c(quantile(traditional_controls_rmse,0.975),quantile(perimiter_rmse,0.975),quantile(rf_rmse,0.975,na.rm=TRUE),quantile(sp_rf_rmse,0.975,na.rm=TRUE),quantile(krig_rmse,0.975),quantile(local_spatial_rf_rmse,0.975),quantile(local_spatial_rf_weather_rmse,0.975,na.rm=TRUE),quantile(knn_rmse,0.975)),mean_difference=c(mean(traditional_controls_mean_diff),mean(perimiter_mean_diff),mean(rf_mean_diff,na.rm=TRUE),mean(sp_rf_mean_diff,na.rm=TRUE),mean(krig_mean_diff),mean(local_spatial_rf_mean_diff),mean(local_spatial_rf_weather_mean_diff),mean(knn_mean_diff)),mean_diff_lower_ci=c(quantile(traditional_controls_mean_diff,0.025),quantile(perimiter_mean_diff,0.025),quantile(rf_mean_diff,0.025,na.rm=TRUE),quantile(sp_rf_mean_diff,0.025,na.rm=TRUE),quantile(krig_mean_diff,0.025),quantile(local_spatial_rf_mean_diff,0.025),quantile(local_spatial_rf_weather_mean_diff,0.025),quantile(knn_mean_diff,0.025)),mean_diff_upper_ci=c(quantile(traditional_controls_mean_diff,0.975),quantile(perimiter_mean_diff,0.975),quantile(rf_mean_diff,0.975,na.rm=TRUE),quantile(sp_rf_mean_diff,0.975,na.rm=TRUE),quantile(krig_mean_diff,0.975,na.rm=TRUE),quantile(local_spatial_rf_mean_diff,0.975,na.rm=TRUE),quantile(local_spatial_rf_weather_mean_diff,0.975,na.rm=TRUE),quantile(knn_mean_diff,0.975,na.rm=TRUE)))
-
-graphing_comparison$model_type<-factor(graphing_comparison$model_type,levels=c("propensity score matching","random forest","spatial random forest","kriging","practitioner selected plots","perimeter method","local spatial random forest","local spatial random forest without weather"))
-
-library(stringr)
-
-
-rmse_plot<-ggplot(graphing_comparison,aes(x=model_type,y=mean_rmse))+geom_bar(stat="identity")+theme_classic()+geom_errorbar(aes(ymin=lower_ci,ymax=upper_ci),width=0.1)+ylab("RMSE of CBI")+xlab("")+theme(text=element_text(size=13))+scale_x_discrete(labels = function(model_type) str_wrap(model_type, width = 6))
-rmse_plot
-
-
-mean_difference_plot<-ggplot(graphing_comparison,aes(x=model_type,y=mean_difference))+geom_bar(stat="identity")+theme_classic()+geom_errorbar(aes(ymin=mean_diff_lower_ci,ymax=mean_diff_upper_ci),width=0.1)+ylab("Mean Error (actual-modeled)")+xlab("")+theme(text=element_text(size=13))+scale_x_discrete(labels = function(model_type) str_wrap(model_type, width = 6))
-mean_difference_plot
-
-
-library(cowplot)
-
-write.csv(graphing_comparison,"./results/model_comparisons.csv")
-
-write.csv(compare_df,"./processed_data/final_comparsion_results_new.csv")
-
-tiff(filename=("./figures/comparison_of_methods.tif"),units='in',compression='lzw',width=7,height=10,res=300)
-plot_grid(rmse_plot,mean_difference_plot,ncol = 1,labels=c("a","b"))
-dev.off()
-
-
-################################
-
-gd<-read.csv("./processed_data/final_comparsion_results_new.csv")
-
-model<-lm(origional_plot_cbi~knn,data=gd)
-knn_plot<-ggplot(gd,aes(y=origional_plot_cbi,x=knn))+geom_abline(intercept=0,slope=1,size=2,color="gray45")+geom_smooth(method="lm")+geom_point()+theme_classic()+ylab("Validaiton plot burn severity (CBI)")+xlab("Propensity score matching (CBI)")+annotate("text",x=3.5,y=1.5,label=paste("Y=",round(model$coefficients[2],2),"* X +",round(model$coefficients[1],2)),size=4)+xlim(1,4)
-
-
-model<-lm(origional_plot_cbi~local_spatial_rf_no_weather,data=gd)
-lsrfnw_plot<-ggplot(gd,aes(y=origional_plot_cbi,x=local_spatial_rf_no_weather))+geom_abline(intercept=0,slope=1,size=2,color="gray45")+geom_smooth(method="lm")+geom_point()+theme_classic()+ylab("Validaiton plot burn severity (CBI)")+xlab("Local spatial RF without weather (CBI)")+annotate("text",x=3.5,y=1.5,label=paste("Y=",round(model$coefficients[2],2),"* X +",round(model$coefficients[1],2)),size=4)+xlim(1,4)
-
-model<-lm(origional_plot_cbi~local_spatial_rf_with_weather.local_spatial_rf_weather,data=gd)
-lsrf_plot<-ggplot(gd,aes(y=origional_plot_cbi,x=local_spatial_rf_with_weather.local_spatial_rf_weather))+geom_abline(intercept=0,slope=1,size=2,color="gray45")+geom_smooth(method="lm")+geom_point()+theme_classic()+ylab("Validaiton plot burn severity (CBI)")+xlab("Local spatial RF (CBI)")+annotate("text",x=3.5,y=1.5,label=paste("Y=",round(model$coefficients[2],2),"* X +",round(model$coefficients[1],2)),size=4)+xlim(1,4)
-
-model<-lm(origional_plot_cbi~control_plot_cbi,data=gd)
-prac_sel_plot<-ggplot(gd,aes(y=origional_plot_cbi,x=control_plot_cbi))+geom_abline(intercept=0,slope=1,size=2,color="gray45")+geom_smooth(method="lm")+geom_point()+theme_classic()+ylab("Validaiton plot burn severity (CBI)")+xlab("Practioner selected plots (CBI)")+annotate("text",x=3.5,y=1.5,label=paste("Y=",round(model$coefficients[2],2),"* X +",round(model$coefficients[1],2)),size=4)+xlim(1,4)
-
-model<-lm(origional_plot_cbi~buffer_method,data=gd)
-buffer_plot<-ggplot(gd,aes(y=origional_plot_cbi,x=buffer_method))+geom_abline(intercept=0,slope=1,size=2,color="gray45")+geom_smooth(method="lm")+geom_point()+theme_classic()+ylab("Validaiton plot burn severity (CBI)")+xlab("Perimeters (CBI)")+annotate("text",x=3.5,y=1.5,label=paste("Y=",round(model$coefficients[2],2),"* X +",round(model$coefficients[1],2)),size=4)+xlim(1,4)
-
-model<-lm(origional_plot_cbi~krigged_values,data=gd)
-krigged_values<-ggplot(gd,aes(y=origional_plot_cbi,x=krigged_values))+geom_abline(intercept=0,slope=1,size=2,color="gray45")+geom_smooth(method="lm")+geom_point()+theme_classic()+ylab("Validaiton plot burn severity (CBI)")+xlab("Kriging (CBI)")+annotate("text",x=3.5,y=1.5,label=paste("Y=",round(model$coefficients[2],2),"* X +",round(model$coefficients[1],2)),size=4)+xlim(1,4)
-
-model<-lm(origional_plot_cbi~rf_prediction,data=gd)
-rf_plot<-ggplot(gd,aes(y=origional_plot_cbi,x=rf_prediction))+geom_abline(intercept=0,slope=1,size=2,color="gray45")+geom_smooth(method="lm")+geom_point()+theme_classic()+ylab("Validaiton plot burn severity (CBI)")+xlab("RF model (CBI)")+annotate("text",x=3.5,y=1.5,label=paste("Y=",round(model$coefficients[2],2),"* X +",round(model$coefficients[1],2)),size=4)+xlim(1,4)
-
-model<-lm(origional_plot_cbi~spatial_rf_prediction,data=gd)
-sprf_plot<-ggplot(gd,aes(y=origional_plot_cbi,x=spatial_rf_prediction))+geom_abline(intercept=0,slope=1,size=2,color="gray45")+geom_smooth(method="lm")+geom_point()+theme_classic()+ylab("Validaiton plot burn severity (CBI)")+xlab("Spatial RF model (CBI)")+annotate("text",x=3.5,y=1.5,label=paste("Y=",round(model$coefficients[2],2),"* X +",round(model$coefficients[1],2)),size=4)+xlim(1,4)
-
-tiff(filename=("./figures/scatter_plots_of_predictions.tif"),units='in',compression='lzw',width=8,height=12,res=300)
-plot_grid(prac_sel_plot,buffer_plot,knn_plot,rf_plot,sprf_plot,krigged_values,lsrf_plot,lsrfnw_plot,ncol = 2,labels="auto",label_x=0.15,label_y=0.9)
-dev.off()
-
-# nolint end
+compare %>%
+  st_drop_geometry %>%
+  select(FID_validation, starts_with("cbi")) %>%
+  write.csv("./processed_data/compare_results.csv")

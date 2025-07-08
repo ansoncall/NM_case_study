@@ -251,6 +251,18 @@ validation_plots$cbi_rf_global <- exact_extract(
   progress = TRUE
 )
 
+# export results
+rf_preds <- validation_plots %>%
+  select(ID, cbi_rf, cbi_rf_global) %>%
+  rename(
+    validation_FID = ID,
+    cbi_rf = cbi_rf,
+    cbi_rf_global_spatial = cbi_rf_global
+  )
+# write out
+rf_preds %>%
+  st_drop_geometry %>%
+  write_csv("./processed_data/rf_preds.csv")
 # local spatial rf ####
 # this includes "local spatial" rf models with and without weather variables.
 
@@ -405,8 +417,8 @@ fit_local_spatial_rf <- function(train_test_list, test = testing) {
     # if the model failed, return a vector of NAs
     message(
       sprintf(
-        "[FID #%d] Warning: No variability in CBI.
-        Returning uniform predictions.",
+        c("[FID #%d] Warning: No variability in CBI.",
+          " Returning uniform predictions."),
         train_test_list$validation_FID
       )
     )
@@ -501,7 +513,15 @@ mean_preds <- purrr::map2(all_preds,
 # bind predictions into data frame
 mean_preds_df <- do.call(rbind, mean_preds) %>%
   as.data.frame() %>%
-  rename(validation_FID = id)
-mean_preds_df
+  rename(validation_FID = id,
+         cbi_local_spatial_rf = predictions,
+         cbi_local_spatial_rf_noweather = predictions_nw) %>%
+  # unlist results
+  mutate(
+    validation_FID = unlist(validation_FID),
+    cbi_local_spatial_rf = unlist(cbi_local_spatial_rf),
+    cbi_local_spatial_rf_noweather = unlist(cbi_local_spatial_rf_noweather)
+  )
+head(mean_preds_df)
 # export
 write_csv(mean_preds_df, "./processed_data/local_spatial_rf_predictions.csv")
