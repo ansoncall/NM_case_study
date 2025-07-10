@@ -80,15 +80,16 @@ rasts <- c(rasts, site_potential, cbi)
 ## build dataframes ####
 rasts_train <- rasts %>%
   # mask out validation plots with 60m buffer and treated areas
-  mask(st_buffer(validation_plots, 60), inverse = TRUE) %>%
-  mask(veg_treatments, inverse = TRUE)
+  mask(st_buffer(validation_plots, 60), inverse = TRUE,
+       names = names(rasts)) %>%
+  mask(veg_treatments, inverse = TRUE, names = names(rasts))
 
 rasts_test <- rasts %>%
   # remove cbi, as it is not used in testing
   tidyterra::select(-cbi) %>%
   # keep only validation plots. add small buffer to ensure entire plot is
   # included in result.
-  mask(st_buffer(validation_plots, 100))
+  mask(st_buffer(validation_plots, 100), names = names(rasts))
 
 # convert to dataframe
 rf_dfs <- map(list(rasts_train, rasts_test), \(x) {
@@ -357,7 +358,7 @@ train_test_each_plot[[96]]$validation_FID
 train_test_each_plot[[157]]$validation_FID
 train_test_each_plot[[230]]$validation_FID
 
-# drop these two plots (note discrepancy between list index and FID values. This
+# drop these three plots (note discrepancy between list index and FID values. This
 # will drop FIDs 96, 156, and 229, which are the problem plots)
 train_test_each_plot <- train_test_each_plot[-c(96, 157, 230)]
 
