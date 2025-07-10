@@ -22,7 +22,7 @@ conflicts_prefer(dplyr::filter, purrr::set_names)
 # testing ####
 # set testing == TRUE to run all functions on a smaller subset of the data for
 # testing purposes. Otherwise, this script will take a very long time to run.
-testing <- TRUE
+testing <- FALSE
 
 # load data ####
 ## composite burn index (CBI) raster ####
@@ -45,8 +45,6 @@ validation_plots <- read_sf(
 burn_perimiter <- read_sf("./processed_data/burn_perimiter.shp")
 
 ## treatments ####
-# Nate: this should be hpcc_new.shp but was hpcc.shp in the original. Not sure
-# what damage this might have done.
 veg_treatments <- read_sf("./processed_data/vegetation_treatments_hpcc_new.shp")
 
 ## predictor rasters ####
@@ -118,7 +116,8 @@ ranger_rf <- ranger(
   cbi ~ elev + aspect + tri + tpi + slope + roads_distance + ppt + tmin +
     tmmx + th + vpdmax + rmax + vs + fm100 + fm1000 + esp + lon + lat,
   rf_dfs$rf_train, # replace after testing
-  # parameter tuning was previously completed with tuneRanger() Nate: check
+  # parameter tuning was previously completed with tuneRanger() and should be
+  # suitable for all models.
   importance = "impurity",
   num.trees = 10, # should be 1000, replace after testing
   mtry = 2, # should be 5, replace after testing
@@ -186,12 +185,6 @@ rf_preds_rast <- rf_dfs$rf_test %>%
   select(lon, lat, rf_predicted) %>%
   rast(crs = cbi)
 
-# # Nate: note weird raster alignment. Also note that some validation plots are
-# # technically outside the burned area and do not have weather data.
-# # nolint start
-# mapview(rf_preds_rast) + mapview(validation_plots) + mapview(veg_treatments) +
-#   mapview(rasts[[12]])
-# # nolint end
 
 # extract rf predicted CBI values for validation plots
 validation_plots$cbi_rf <- exact_extract(
@@ -229,6 +222,22 @@ spatial_rf_model <- splmRF(
   min.node.size = 2,
   sample.fraction = 0.89
 )
+# some notes from output:
+
+# var_adjust was not specified and the sample size exceeds 100,000, so the
+# default var_adjust value is being changed from "theoretical" to "none". To
+# override this behavior, rerun and set var_adjust in local. Be aware that
+# setting var_adjust to "theoretical" may result in exceedingly long
+# computational times.
+
+# Warning messages:
+# 1: Quick-TRANSfer stage steps exceeded maximum (= 67794200)
+# 2: In UseMethod("depth") :
+#   no applicable method for 'depth' applied to an object of class "NULL"
+# 3: In UseMethod("depth") :
+#   no applicable method for 'depth' applied to an object of class "NULL"
+
+# TODO: look into this, make sure it's not too problematic.
 spatial_rf_model
 
 ## extract global predictions ####
@@ -239,8 +248,6 @@ rf_dfs$rf_test$rf_global_predicted <- predict(spatial_rf_model,
 rf_global_preds_rast <- rf_dfs$rf_test %>%
   select(lon, lat, rf_global_predicted) %>%
   rast(crs = crs(cbi))
-# # Nate: check if you want.
-# mapview(rf_global_preds_rast) + mapview::mapview(validation_plots) # nolint
 
 # extract rf predicted CBI values for validation plots
 validation_plots$cbi_rf_global <- exact_extract(
@@ -271,32 +278,12 @@ build_train_test <- function(id, test = testing) {
   # grab one plot
   one_plot <- validation_plots[validation_plots$FID_1 == id, ]
 
-  # Nate: 1243 buffer was arbitrarily defined, here equal to roughly a based on
-  # a ~1200 ac circle: sqrt((1200 acres * 4046.86 m^2/acre) / pi)
-
-  # rethinking this, I think we should target a sample size that keeps us
-  # well under splmRF's default 5000 cell max threshold (though you can change
-  # the threshold if you want). We're actually getting 6420 cells with the above
-  # values. see:
-
-  # sum(neighborhood_mask[], na.rm = TRUE) # 6420 with 1243 m buffer # nolint
-
-  # I'm going to suggest a buffer of 1000m, giving a neighborhood of ~4223
-  # cells. 105 of those will be masked out since they're in the validation area.
-  # We need to update the manuscript regardless, because the old "607 ha" value
-  # was wrong anyway.
-
-  # note that this buffer size REALLY impacts the memory bottlenecking and speed
-  # of the splmRF fitting.
-
-  # define masks for target and neighborhood. smaller neighborhood if testing ==
-  # TRUE
   target_poly <- st_buffer(one_plot, 60)
 
   if (test == TRUE) {
     buffer_size <- 100
   } else {
-    buffer_size <- 1000
+    buffer_size <- 800
   }
 
   suppressWarnings( # ignore attribute variable warning
@@ -376,25 +363,6 @@ train_test_each_plot <- train_test_each_plot[-c(96, 157, 230)]
 
 # takes train and test sfs and returns prediction sf
 fit_local_spatial_rf <- function(train_test_list, test = testing) {
-  # Nate: ran into a problem when developing the "testing" workflow that sort of
-  # explains why local rf performs so well--in a way that's pretty easy to
-  # understand. I think we've already realized this, but it's really obvious in
-  # this instance. When the training set is small enough, there are some cases
-  # where all pixels have the same CBI value. There is no variability there, and
-  # thus the predictors are meaningless. This is the extreme case, but similar
-  # things occur when some CBI values become rare or absent, e.g. there are zero
-  # or only a few CBI values == 1 in the training set. This naturally leads to a
-  # model fit that never (or rarely) has to "consider" the possibility of a 1
-  # ever occurring. This natural bias in the model doesn't reflect any causal
-  # mechanism, just the inherent spatial autocorrelation, which is another way
-  # of saying that the local-spatial RF is doing it's job. The narrowing of the
-  # possible outcome space is a benefit to prediction accuracy.
-
-  # However, to even get this function to work for those instances with no
-  # variability in the training set, we need to recognize that the model will
-  # error out and catch those errors so we can still return the predictions (in
-  # the case of, e.g., all training data CBI == 2, the prediction would just be
-  # a field of 2's).
 
   local_spatial_rf_model <- try(splmRF(
     cbi ~ elev + aspect + tri + tpi + slope + roads_distance + ppt +
@@ -458,8 +426,6 @@ fit_local_spatial_rf <- function(train_test_list, test = testing) {
 
 # map this over the list of training and testing data to fit models and extract
 # predictions
-# Nate: tried parallelizing this, but I could never get it to work faster than
-# serial execution. I think the bottleneck is memory.
 all_preds <- purrr::map(train_test_each_plot,
                         fit_local_spatial_rf,
                         .progress = TRUE)
