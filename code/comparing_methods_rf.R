@@ -358,8 +358,8 @@ train_test_each_plot[[96]]$validation_FID
 train_test_each_plot[[157]]$validation_FID
 train_test_each_plot[[230]]$validation_FID
 
-# drop these three plots (note discrepancy between list index and FID values. This
-# will drop FIDs 96, 156, and 229, which are the problem plots)
+# drop these three plots (note discrepancy between list index and FID values.
+# This will drop FIDs 96, 156, and 229, which are the problem plots)
 train_test_each_plot <- train_test_each_plot[-c(96, 157, 230)]
 
 # takes train and test sfs and returns prediction sf

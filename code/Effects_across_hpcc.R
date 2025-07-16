@@ -1,131 +1,272 @@
-# load packages
-library(raster)
+# evaluate treatment effects across the HPCC burn area, using a couple of the
+# different counterfactual methods.
+
+# load packages ####
 library(terra)
 library(sf)
-library(stars)
-library(ggplot2)
+library(tidyverse)
 library(spmodel)
 
-############# Load processed data
+# set options ####
+testing <- TRUE # subsamples to reduce run time.
 
-elev_down<-raster("./processed_data/elev_down.tif")
-aspect_down<-raster("./processed_data/aspect_down.tif")
-TRI_down<-raster("./processed_data/TRI_down.tif")
-TPI_down<-raster("./processed_data/TPI_down.tif")
-slope_down<-raster("./processed_data/slope_down.tif")
-roads_distance<-raster("./processed_data/distance_to_road.tif")
-site_potential<-raster("./processed_data/lf_site_potential_new.tif")
-vpdmax<-raster("./processed_data/vpdmax.tif")
-ppt<-raster("./processed_data/ppt.tif")
-tmin<-raster("./processed_data/tmin.tif")
+# load data ####
+## composite burn index (CBI) raster ####
+cbi <- rast("./processed_data/masked_raster.tif")
+# as usual, set "unmappable" -> NA and "outside of perimeter" -> 1 (unburned)
+names(cbi) <- "cbi"
+cbi[cbi == 9] <- NA
+cbi[cbi == 0] <- 1
 
-masked_cbi<-raster("./processed_data/masked_raster.tif")
+## validation plots ####
+validation_plots <- read_sf(
+  "./processed_data/val_points_revised.shp",
+  fid_column_name = "ID"
+) %>%
+  filter(as.integer(ID) < 352) %>%
+  st_transform(crs = crs(cbi))
 
-CBI<-raster("./processed_data/clipped_burn_raster.tif")
+## HPCC burn perimeter ####
+burn_perimeter <- read_sf("./processed_data/burn_perimeter.shp")
 
-CBI[CBI==9]<-NA
-CBI[CBI==0]<-1
+## treatments ####
+# Nate: this should be hpcc_new.shp but was hpcc.shp in the original. Not sure
+# what damage this might have done.
+veg_treatments <- read_sf(
+  "./processed_data/vegetation_treatments_hpcc_new.shp"
+  ) %>%
+  # add rownum as first column
+  mutate(rownum = row_number(), .before = everything())
 
-veg_treatments<-read_sf("./processed_data/vegetation_treatments_hpcc_new.shp")
-veg_treatments<-st_make_valid(veg_treatments)
-veg_treatments<-st_transform(veg_treatments,crs=crs(masked_cbi))
-veg_treatments_buffer<-st_buffer(veg_treatments,60)
+## predictor rasters ####
+# LandFire ESP
+site_potential <- rast("./processed_data/lf_site_potential_new.tif")
+# set active category to 2, which is the fine-scale zone*esp*esplf
+# categorization
+activeCat(site_potential) <- 2
+names(site_potential) <- "esp"
 
-masked_cbi<-raster::mask(masked_cbi,st_as_sf(veg_treatments_buffer),inverse=TRUE)
+# additional variables
+raster_filenames <- c(
+  "elev_down", "aspect_down", "TRI_down", "TPI_down", "slope_down",
+  "distance_to_road", "ppt", "tmin", "tmmx", "th",
+  "vpdmax", "rmax", "vs", "fm100", "fm1000"
+)
+raster_varnames <- c(
+  "elev", "aspect", "tri", "tpi", "slope", "roads_distance", "ppt",
+  "tmin", "tmmx", "th", "vpdmax", "rmax", "vs", "fm100", "fm1000"
+)
+rasts <- map(raster_filenames, function(x) {
+  # load each raster file
+  rast(paste0("./processed_data/", x, ".tif"))
+}) %>%
+  # unlist
+  rast
+# set names for each layer
+names(rasts) <- raster_varnames
+# rename and combine other raster layers
+rasts <- c(rasts, site_potential, cbi)
 
-burn_perimiter<-read_sf("./processed_data/burn_perimiter.shp")
+# spatial random forest ####
+# Nate: why are we redoing this? why don't we just load in the predictions we've already generated in the comparing_methods script?
+# Answer: we need to do it for the treated areas, not for the validation plots.
+# local spatial rf ####
+# this includes "local spatial" rf models with and without weather variables.
 
-spatial_rf_interative<-function(one_plot){
+# makes train and test data for each plot. works with treatment polys.
+build_train_test <- function(trt_rownum, test = testing) {
+  # grab one plot (one treatment poly).
+  one_plot <- veg_treatments %>% filter(rownum == trt_rownum)
 
-  size_of_perimiter<-sqrt((150*4046.86+as.numeric(st_area(one_plot)))/pi)
-  
-  one_plot_buffer<-st_buffer(one_plot,size_of_perimiter)
-  
-  clipped_burn_raster<-raster::crop(masked_cbi,st_as_sf(one_plot_buffer))
-  
-  clipped_burn_raster[clipped_burn_raster==0]<-1
-  clipped_burn_raster[clipped_burn_raster==9]<-NA
-  
-  training_df<-as.data.frame(rasterToPoints(clipped_burn_raster))
-  
-  training_df$CBI<-training_df$masked_raster
-  training_df$elev<-raster::extract(elev_down,y=training_df[,1:2])
-  training_df$aspect<-raster::extract(aspect_down,y=training_df[,1:2])
-  training_df$TRI<-raster::extract(TRI_down,y=training_df[,1:2])
-  training_df$TPI<-raster::extract(TPI_down,y=training_df[,1:2])
-  training_df$slope<-raster::extract(slope_down,y=training_df[,1:2])
-  training_df$road_distance<-raster::extract(roads_distance,y=training_df[,1:2])
-  training_df$env_potential<-as.factor(raster::extract(site_potential,y=training_df[,1:2]))
-  training_df$ppt<-raster::extract(ppt,y=training_df[,1:2])
-  training_df$tmin<-raster::extract(ppt,y=training_df[,1:2])
-  training_df$ppt<-raster::extract(tmin,y=training_df[,1:2])
-  training_df$vpdmax<-raster::extract(vpdmax,y=training_df[,1:2])
-  
-  training_df<-training_df[complete.cases(training_df),]
-  
-  training_df<-st_as_sf(training_df,coords=c("x","y"),crs=st_crs(site_potential))
-  
-  training_df$lat<-as.data.frame(rasterToPoints(clipped_burn_raster))[,1]
-  training_df$lon<-as.data.frame(rasterToPoints(clipped_burn_raster))[,2]
-  training_df$lat2<-training_df$lat**2
-  training_df$lon2<-training_df$lon**2
-  
-  
-  try(spatial_rf_model<-splmRF(CBI~elev+aspect+TRI+TPI+slope+road_distance+env_potential+lat+lon+tmin+vpdmax+ppt,data=training_df,spcov_type = "exponential",local=c(parallel=TRUE,ncores=10),mtry=4,min.node.size=2,sample.fraction=0.89))
-  
-  #
+  # Nate: looks like you had a buffer size of 150 here. Much smaller than what
+  # was used in the compare_methods script. Not sure what to use here.
+  target_poly <- st_buffer(one_plot, 60)
 
-  
-  predict_df<-data.frame(lat=rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,1],
-                         lon=rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,2])
-  
-  predict_df$elev<-raster::extract(elev_down,y=predict_df[,1:2])
-  predict_df$aspect<-raster::extract(aspect_down,y=predict_df[,1:2])
-  predict_df$TRI<-raster::extract(TRI_down,y=predict_df[,1:2])
-  predict_df$TPI<-raster::extract(TPI_down,y=predict_df[,1:2])
-  predict_df$slope<-raster::extract(slope_down,y=predict_df[,1:2])
-  predict_df$road_distance<-raster::extract(roads_distance,y=predict_df[,1:2])
-  predict_df$env_potential<-as.factor(raster::extract(site_potential,y=predict_df[,1:2]))
-  predict_df$ppt<-raster::extract(ppt,y=predict_df[,1:2])
-  predict_df$tmin<-raster::extract(ppt,y=predict_df[,1:2])
-  predict_df$ppt<-raster::extract(tmin,y=predict_df[,1:2])
-  predict_df$vpdmax<-raster::extract(vpdmax,y=predict_df[,1:2])
-  
-  
-  predict_df<-predict_df[complete.cases(predict_df),]
-  
-  predict_df<-st_as_sf(predict_df,coords=c("lat","lon"),crs=st_crs(site_potential))
-  
-  predict_df$lat<-rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,1]
-  predict_df$lon<-rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,2]
-  
-  #predict_df$modeled_values<-predict(ranger_rf,data=predict_df,na.rm=TRUE)$predictions
-  if (sd(training_df$CBI,na.rm=TRUE)==0){predict_df$modeled_values<-mean(training_df$CBI,na.rm=TRUE)}
-  
-  if (sd(training_df$CBI,na.rm=TRUE)>0){predict_df$modeled_values<-predict(spatial_rf_model,newdata=predict_df,local=FALSE)}
-  
-  mean_cbi<-predict_df$modeled_values[1]
-  for_conversion<-data.frame(lat=predict_df$lat,lon=predict_df$lon,modeled_values=as.numeric(predict_df$modeled_values))
-  
-  if (nrow(predict_df)>1){
-  
-    if (length(unique(predict_df$lat))==1 |length(unique(predict_df$lon))==1){mean_cbi=mean(predict_df$modeled_values)
-    
-    
-    
-    }else{
-    
+  if (test == TRUE) {
+    buffer_size <- 100
+  } else {
+    buffer_size <- 200
+  }
 
-  
-  predict_raster<-rasterFromXYZ(for_conversion,crs=crs(masked_cbi))
-  
-  mean_cbi<-raster::extract(predict_raster$modeled_values,st_as_sf(one_plot),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-  }}
-  
-  return(list(mean_cbi,for_conversion))
-  
-  
+  suppressWarnings( # ignore attribute variable warning
+    neighborhood_poly <- st_difference(st_buffer(one_plot, buffer_size),
+                                       target_poly)
+  )
+
+  # crop rasts to minimize raster read time
+  rasts_crop <- rasts %>%
+    crop(st_bbox(neighborhood_poly))
+
+  # rasterize both masks in one go: assign 1 to target, 2 to neighborhood
+  masks_raster <- dplyr::bind_rows(
+    target_poly %>% mutate(mask_val = 1),
+    neighborhood_poly %>% mutate(mask_val = 2)
+  ) %>%
+    rasterize(rasts_crop, field = "mask_val")
+
+  # extract the masks
+  target_mask <- ifel(masks_raster == 1, 1, NA)
+  neighborhood_mask <- ifel(masks_raster == 2, 1, NA)
+
+  # apply masks to predictor variable rasters
+  train_pts <- rasts_crop %>%
+    mask(neighborhood_mask) %>%
+    as.points
+  # retain coords as attributes
+  train_xy <- crds(train_pts)
+  train_pts$lon <- train_xy[, 1]
+  train_pts$lat <- train_xy[, 2]
+  # convert to sf
+  train <- train_pts %>%
+    st_as_sf(coords = c("x", "y"), crs = st_crs(rasts), remove = FALSE)
+  # repeat for test data
+  test_pts <- rasts_crop %>%
+    mask(target_mask) %>%  # will also include 60m buffer but this is ok.
+    as.points
+  test_xy <- crds(test_pts)
+  test_pts$lon <- test_xy[, 1]
+  test_pts$lat <- test_xy[, 2]
+  test <- test_pts %>%
+    st_as_sf(coords = c("x", "y"), crs = st_crs(rasts))
+
+  return(list(
+    trt_rownum = trt_rownum,
+    train = train,
+    test = test
+  ))
 }
+
+# map function over all validation plot FIDs
+train_test_each_plot <- purrr::map(veg_treatments$rownum,
+                                   build_train_test,
+                                   .progress = TRUE)
+
+# check sizes of train and test data
+small_train_test <- c()
+walk(train_test_each_plot, function(x) {
+  # check that the train and test data are not empty
+  if (nrow(x$train) < 5 || nrow(x$test) == 0) {
+    message(sprintf(
+      "[rownum #%d] Warning: %d test values and %d train for this plot",
+      x$trt_rownum, nrow(x$test), nrow(x$train)
+    )
+    )
+    small_train_test <<- c(small_train_test, x$trt_rownum)
+  }
+})
+# remove treatments with small train or test data Nate: I don't know if this was
+# your solution, as i didn't parse your code too carefully.  do you recall?
+`%ni%` <- Negate(`%in%`)
+train_test_each_plot_sub <- Filter(\(x) x$trt_rownum %ni% small_train_test, train_test_each_plot)
+
+# takes train and test sfs and returns prediction sf
+fit_local_spatial_rf <- function(train_test_list) {
+  # train_test_list <- train_test_each_plot[[1]] # testing
+  local_spatial_rf_model <- try(splmRF(
+    # Nate: no weather included here. I think this is correct - check?
+    cbi ~ elev + aspect + tri + tpi + slope + roads_distance + ppt +
+      tmin + vpdmax + esp + lon + lat,
+    data = train_test_list$train,
+    spcov_type = "exponential", # this is the default already.
+    local = FALSE, # no spatial approximation!
+    mtry = 4,
+    min.node.size = 2,
+    sample.fraction = 0.89
+  ), silent = TRUE)
+
+  # Check if the "no variability" error has occurred. This happens when the
+  # training data has no variation in CBI value. First check if an error
+  # occurred, then check that the error message matches the expected one.
+  if (inherits(local_spatial_rf_model, "try-error") &&
+      any(grepl("The response has no variability",
+                attr(local_spatial_rf_model, "condition")$message))
+  ) {
+    # if the model failed, return a vector of NAs
+    message(
+      sprintf(
+        c("[FID #%d] Warning: No variability in CBI.",
+          " Returning uniform predictions."),
+        train_test_list$validation_FID
+      )
+    )
+    mean_cbi <- mean(train_test_list$train$cbi, na.rm = TRUE)
+    return(list(
+      trt_rownum = train_test_list$trt_rownum,
+      predictions = rep(mean_cbi, nrow(train_test_list$test)),
+      predictions_noweather = rep(mean_cbi, nrow(train_test_list$test))
+    ))
+  }
+
+  # predict for the validation plot. for speed, just focus on the pixels in the
+  # validation plot area.
+  predictions <- predict(local_spatial_rf_model, newdata = train_test_list$test)
+
+  list(
+    trt_rownum = train_test_list$trt_rownum,
+    predictions = predictions
+  )
+}
+
+# map this over the list of training and testing data to fit models and extract
+# predictions
+all_preds <- purrr::map(train_test_each_plot_sub,
+                        fit_local_spatial_rf,
+                        .progress = TRUE)
+
+# extracts raster predictions from validation plot areas
+get_mean_predictions <- function(preds_vec, train_test_one_plot) {
+  # preds_vec <- all_preds[[31]] # testing
+  # train_test_one_plot <- train_test_each_plot_sub[[31]] # testing
+  # get id
+  id <- train_test_one_plot$trt_rownum
+  # get preds vec id
+  p_id <- preds_vec$trt_rownum
+  # check that the id matches
+  if (id != p_id) {
+    stop(sprintf("ID mismatch: %d != %d", id, p_id))
+  }
+  # get geo of validation plot
+  one_plot <- veg_treatments[veg_treatments$rownum == id, ]
+  # get test_sf
+  test_sf <- train_test_one_plot$test
+  # add predictions to test_sf
+  test_sf$cbi_local_spatial_rf <- preds_vec$predictions
+
+  # convert predictions to raster and extract by exact plot polygon
+  predict_rast <- test_sf %>%
+    vect %>%
+    rasterize(rasts, field = "cbi_local_spatial_rf")
+
+  # extract
+  predict_mean <- exact_extract(predict_rast,
+                                one_plot,
+                                fun = "mean",
+                                weights = "area")
+  # final output is the mean cbi value of the validation plot
+  list(id = id,
+       predictions = predict_mean)
+}
+
+mean_preds <- purrr::map2(all_preds,
+                          train_test_each_plot_sub,
+                          get_mean_predictions,
+                          .progress = TRUE)
+
+# bind predictions into data frame
+mean_preds_df <- do.call(rbind, mean_preds) %>%
+  as.data.frame() %>%
+  rename(rownum = id,
+         cbi_local_spatial_rf = predictions) %>%
+  # unlist results
+  mutate(
+    rownum = unlist(rownum),
+    cbi_local_spatial_rf = unlist(cbi_local_spatial_rf)
+  )
+head(mean_preds_df)
+# export
+write_csv(mean_preds_df, "./processed_data/trt_rf_preds.csv")
+
+# TODO tidy below
 
 descriptions<-tolower(unique(veg_treatments$Dscrptn))
 
@@ -154,11 +295,11 @@ for (i in 1:nrow(veg_treatments)){
 
   print(i/l*100)
   output<-spatial_rf_interative(veg_treatments[i,])
-    
-    
+
+
   veg_treatments$control_burn_severity[i]<-output[[1]]
   map_values<-rbind(map_values,output[2][[1]])
-  
+
   st_write(veg_treatments,dsn = "./results/hpcc_processed_cbi_new.shp",append=FALSE)
   write.csv(map_values,"./results/mapping_predictions.csv")
 }

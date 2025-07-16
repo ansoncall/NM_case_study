@@ -17,7 +17,7 @@ library(conflicted)
 
 # set options ####
 conflicts_prefer(dplyr::filter)
-testing <- TRUE # reduces sample size for testing purposes.
+testing <- FALSE # reduces sample size for testing purposes.
 
 #load data ####
 ## composite burn index (CBI) raster ####
