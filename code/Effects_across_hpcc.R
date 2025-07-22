@@ -5,7 +5,9 @@
 library(terra)
 library(sf)
 library(tidyverse)
+library(exactextractr)
 library(spmodel)
+library(caret)
 
 # set options ####
 testing <- TRUE # subsamples to reduce run time.
@@ -18,14 +20,6 @@ names(cbi) <- "cbi"
 cbi[cbi == 9] <- NA
 cbi[cbi == 0] <- 1
 
-## validation plots ####
-validation_plots <- read_sf(
-  "./processed_data/val_points_revised.shp",
-  fid_column_name = "ID"
-) %>%
-  filter(as.integer(ID) < 352) %>%
-  st_transform(crs = crs(cbi))
-
 ## HPCC burn perimeter ####
 burn_perimeter <- read_sf("./processed_data/burn_perimeter.shp")
 
@@ -34,9 +28,13 @@ burn_perimeter <- read_sf("./processed_data/burn_perimeter.shp")
 # what damage this might have done.
 veg_treatments <- read_sf(
   "./processed_data/vegetation_treatments_hpcc_new.shp"
-  ) %>%
+) %>%
   # add rownum as first column
   mutate(rownum = row_number(), .before = everything())
+
+## gridded candidate plots ####
+gridded_plots <- read_sf("./processed_data/gridded_candidate_plots.shp") %>%
+  st_transform(st_crs(cbi))
 
 ## predictor rasters ####
 # LandFire ESP
@@ -67,15 +65,23 @@ names(rasts) <- raster_varnames
 # rename and combine other raster layers
 rasts <- c(rasts, site_potential, cbi)
 
-# spatial random forest ####
-# Nate: why are we redoing this? why don't we just load in the predictions we've already generated in the comparing_methods script?
-# Answer: we need to do it for the treated areas, not for the validation plots.
-# local spatial rf ####
+# TODO ppt was missing from gridded plots. Could fix this in weather_and_knn
+# script. Just adding it here for now.
+names(gridded_plots)
+gridded_plots$ppt <- exact_extract(
+  rasts$ppt,
+  gridded_plots,
+  fun = "mean",
+  weights = "area",
+  progress = TRUE
+)
+# local spatial random forest ####
 # this includes "local spatial" rf models with and without weather variables.
 
 # makes train and test data for each plot. works with treatment polys.
 build_train_test <- function(trt_rownum, test = testing) {
   # grab one plot (one treatment poly).
+  # TODO fix "no visible binding for rownum"
   one_plot <- veg_treatments %>% filter(rownum == trt_rownum)
 
   # Nate: looks like you had a buffer size of 150 here. Much smaller than what
@@ -154,21 +160,21 @@ walk(train_test_each_plot, function(x) {
     small_train_test <<- c(small_train_test, x$trt_rownum)
   }
 })
-# remove treatments with small train or test data Nate: I don't know if this was
-# your solution, as i didn't parse your code too carefully.  do you recall?
+# remove treatments with small train or test data
 `%ni%` <- Negate(`%in%`)
-train_test_each_plot_sub <- Filter(\(x) x$trt_rownum %ni% small_train_test, train_test_each_plot)
+train_test_each_plot_sub <- Filter(\(x) x$trt_rownum %ni% small_train_test,
+                                   train_test_each_plot)
 
 # takes train and test sfs and returns prediction sf
 fit_local_spatial_rf <- function(train_test_list) {
-  # train_test_list <- train_test_each_plot[[1]] # testing
+  # train_test_list <- train_test_each_plot[[1]] # testing # nolint
   local_spatial_rf_model <- try(splmRF(
-    # Nate: no weather included here. I think this is correct - check?
+    # no weather included here
     cbi ~ elev + aspect + tri + tpi + slope + roads_distance + ppt +
       tmin + vpdmax + esp + lon + lat,
     data = train_test_list$train,
     spcov_type = "exponential", # this is the default already.
-    local = FALSE, # no spatial approximation!
+    local = list(parallel = TRUE, ncores = parallel::detectCores() - 4),
     mtry = 4,
     min.node.size = 2,
     sample.fraction = 0.89
@@ -181,7 +187,8 @@ fit_local_spatial_rf <- function(train_test_list) {
       any(grepl("The response has no variability",
                 attr(local_spatial_rf_model, "condition")$message))
   ) {
-    # if the model failed, return a vector of NAs
+    # if the model failed due to no variability in predictor data, return a
+    # prediction based on the mean (only) CBI value in the training data.
     message(
       sprintf(
         c("[FID #%d] Warning: No variability in CBI.",
@@ -190,21 +197,20 @@ fit_local_spatial_rf <- function(train_test_list) {
       )
     )
     mean_cbi <- mean(train_test_list$train$cbi, na.rm = TRUE)
-    return(list(
+    out <- list(
       trt_rownum = train_test_list$trt_rownum,
-      predictions = rep(mean_cbi, nrow(train_test_list$test)),
-      predictions_noweather = rep(mean_cbi, nrow(train_test_list$test))
-    ))
+      predictions = rep(mean_cbi, nrow(train_test_list$test))
+    )
+  } else {
+    # predict for the validation plot using the rf model.
+    predictions <- predict(local_spatial_rf_model,
+                           newdata = train_test_list$test)
+    out <- list(
+      trt_rownum = train_test_list$trt_rownum,
+      predictions = predictions
+    )
   }
-
-  # predict for the validation plot. for speed, just focus on the pixels in the
-  # validation plot area.
-  predictions <- predict(local_spatial_rf_model, newdata = train_test_list$test)
-
-  list(
-    trt_rownum = train_test_list$trt_rownum,
-    predictions = predictions
-  )
+  out
 }
 
 # map this over the list of training and testing data to fit models and extract
@@ -213,10 +219,8 @@ all_preds <- purrr::map(train_test_each_plot_sub,
                         fit_local_spatial_rf,
                         .progress = TRUE)
 
-# extracts raster predictions from validation plot areas
+# extracts raster predictions from validation plot areas.
 get_mean_predictions <- function(preds_vec, train_test_one_plot) {
-  # preds_vec <- all_preds[[31]] # testing
-  # train_test_one_plot <- train_test_each_plot_sub[[31]] # testing
   # get id
   id <- train_test_one_plot$trt_rownum
   # get preds vec id
@@ -238,13 +242,14 @@ get_mean_predictions <- function(preds_vec, train_test_one_plot) {
     rasterize(rasts, field = "cbi_local_spatial_rf")
 
   # extract
-  predict_mean <- exact_extract(predict_rast,
-                                one_plot,
-                                fun = "mean",
-                                weights = "area")
+  predict_mean <- exactextractr::exact_extract(predict_rast,
+                                               one_plot,
+                                               fun = "mean",
+                                               weights = "area")
   # final output is the mean cbi value of the validation plot
+  # Nate: could return rasters here as well if we want to map some predictions
   list(id = id,
-       predictions = predict_mean)
+       mean_predictions = predict_mean)
 }
 
 mean_preds <- purrr::map2(all_preds,
@@ -262,104 +267,65 @@ mean_preds_df <- do.call(rbind, mean_preds) %>%
     rownum = unlist(rownum),
     cbi_local_spatial_rf = unlist(cbi_local_spatial_rf)
   )
-head(mean_preds_df)
+
 # export
 write_csv(mean_preds_df, "./processed_data/trt_rf_preds.csv")
 
-# TODO tidy below
+# cluster-based matching ####
 
-descriptions<-tolower(unique(veg_treatments$Dscrptn))
+# remove the gridded plots that touch off-limits areas
+# Nate: we don't really need to exclude validation plot areas, right? Just
+# excluding the veg treatments here.
+touch_mat <- st_intersects(gridded_plots, veg_treatments, sparse = FALSE)
+non_touching_idx <- which(rowSums(touch_mat) == 0)
 
-thinning<-descriptions[grepl("thin",descriptions)]
-cutting<-descriptions[grepl("cut",descriptions)]
-defens<-descriptions[grepl("defens",descriptions)]
-burn<-descriptions[grepl("burn",descriptions)]
-fuel<-descriptions[grepl("fuel",descriptions)]
-fire<-descriptions[grepl("fire",descriptions)]
+gridded_plots_clean <- gridded_plots[non_touching_idx, ] %>%
+  # normalize variables
+  mutate(across(c(elev, ppt, vs),
+                ~ (. - mean(.)) / sd(.),
+                .names = "{col}_norm"))
 
-
-treatments_to_use<-unique(c(thinning,cutting,defens,burn,fuel,fire))
-
-
-veg_treatments<-veg_treatments[tolower(veg_treatments$Dscrptn) %in% treatments_to_use,]
-
-
-veg_treatments$control_burn_severity<-NA
-map_values<-data.frame()
-
-l<-nrow(veg_treatments)
-
-veg_treatments<-st_cast(veg_treatments,"POLYGON")
-
-for (i in 1:nrow(veg_treatments)){
-
-  print(i/l*100)
-  output<-spatial_rf_interative(veg_treatments[i,])
-
-
-  veg_treatments$control_burn_severity[i]<-output[[1]]
-  map_values<-rbind(map_values,output[2][[1]])
-
-  st_write(veg_treatments,dsn = "./results/hpcc_processed_cbi_new.shp",append=FALSE)
-  write.csv(map_values,"./results/mapping_predictions.csv")
-}
-
-#### adding in propensity score matching here
-
-
-veg_treatments<-read_sf("./results/hpcc_processed_cbi_new.shp")
-
-gridded_plots<-read_sf("gridded_candidate_plots.shp")
-
-
-gridded_plots<-st_transform(gridded_plots,st_crs(CBI))
-#3control_plots<-st_transform(control_plots,st_crs(CBI))
-
-gridded_plots_2<-st_difference(gridded_plots,st_union(veg_treatments))
-
-
-gridded_plots_3<-st_difference(gridded_plots_2,st_union(st_buffer(validation_plots,60)))
-
-max_area<-max(st_area(gridded_plots_3))
-
-gridded_plots_4<-gridded_plots_3[as.numeric(st_area(gridded_plots_3))>as.numeric(max_area)-50,]
-
-library(caret)
-#### normalizing variables first
-
-gridded_plots_4$elevation_norm<-(gridded_plots_4$elevatn-mean(gridded_plots_4$elevatn))/sd(gridded_plots_4$elevatn)
-gridded_plots_4$ppt_norm<-(gridded_plots_4$nrml_pp-mean(gridded_plots_4$nrml_pp))/sd(gridded_plots_4$nrml_pp)
-gridded_plots_4$vs_norm<-(gridded_plots_4$vs-mean(gridded_plots_4$vs))/sd(gridded_plots_4$vs)
-
-
-nearest_model<-knnreg(cbi~elevation_norm+ppt_norm+vs_norm,data=gridded_plots_4,k=1)
+# find nearest neighbor
+nearest_model <- knnreg(cbi ~ elev_norm + ppt_norm + vs_norm,
+                        data = gridded_plots_clean,
+                        k = 1)
 summary(nearest_model)
 
-ppt<-raster("./processed_data/ppt.tif")
-elev_down<-raster("./processed_data/elev_down.tif")
-vs<-raster("./processed_data/vs.tif")
+# Save means and sds of predictors for all gridded plots. Required to
+# z-transform treatment polygon values at the same scale.
+vars <- c("elev", "vs", "ppt")
+mu_sigma <- lapply(vars, function(v) {
+  c(mu = mean(gridded_plots_clean[[v]]),
+    sigma = sd(gridded_plots_clean[[v]]))
+})
+names(mu_sigma) <- vars
 
-predict_df<-st_as_sf(veg_treatments)
+# extract mean values of predictors for each treatment polygon. bind columns to
+# dataframe and apply z transform.
+mean_predictor_vals <- map(vars, function(x) {
+  # extract mean values for each predictor variable
+  veg_treatments[[x]] <- exact_extract(rasts[[x]], veg_treatments,
+                                       fun = "mean", weights = "area")
+}) %>%
+  set_names(vars) %>%
+  bind_cols() %>%
+  mutate(
+    elev_norm = (elev - mu_sigma$elev["mu"]) / mu_sigma$elev["sigma"],
+    vs_norm   = (vs   - mu_sigma$vs["mu"])   / mu_sigma$vs["sigma"],
+    ppt_norm  = (ppt  - mu_sigma$ppt["mu"])  / mu_sigma$ppt["sigma"]
+  )
+# bind to veg_treatments
+veg_treatments <- bind_cols(veg_treatments, mean_predictor_vals)
+# predict from knn model
+veg_treatments$knn_pred <- predict(nearest_model, veg_treatments)
 
-predict_df$elev<-raster::extract(elev_down,y=predict_df,fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-predict_df$vs<-raster::extract(vs,y=st_as_sf(predict_df),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-predict_df$ppt<-raster::extract(ppt,y=st_as_sf(predict_df),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
+# write over veg_treatments shapefile. now includes cluster-based matching
+# method cbi predictions as attribute data.
+st_write(veg_treatments, dsn = "./results/hpcc_processed_cbi_new.shp",
+         append = FALSE)
 
-predict_df$elevation_norm<-(predict_df$elev-mean(gridded_plots_4$elevatn))/sd(gridded_plots_4$elevatn)
-predict_df$ppt_norm<-(predict_df$ppt-mean(gridded_plots_4$nrml_pp))/sd(gridded_plots_4$nrml_pp)
-predict_df$vs_norm<-(predict_df$vs-mean(gridded_plots_4$vs))/sd(gridded_plots_4$vs)
-
-
-
-predict_df$knn_1<-predict(nearest_model,as.data.frame(predict_df))
-
-
-predict_df<-as.data.frame(predict_df)
-
-veg_treatments$knn_pred<-predict_df$knn_1
-
-
-st_write(veg_treatments,dsn = "./results/hpcc_processed_cbi_new.shp",append=FALSE)
-
-
-
+# TODO update mean_preds dataframe and write out csv predictions. file now to
+# include cluster-based matching method cbi predictions in addition to the
+# previously-generated rf-based predictions.
+# mean_preds_df
+# write_csv(meat_preds_df, "./processed_data/trt_rf_preds.csv") # nolint

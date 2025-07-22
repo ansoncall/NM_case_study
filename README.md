@@ -9,6 +9,6 @@ Run the scripts in the following order:
 4b. comparing_methods
 5. rmse_and_plots
 6. effects_across_hpcc  # runs PSM and local spatial rf (noweather) to generate counterfactual maps.
-7. plotting_hpcc_results # figures to plot results from 5. 
-8. CV_different_sizes_plots # this is basically the same as #4 but uses different plot sizes. 
+7. plotting_hpcc_results # figures to plot results from 6. 
+8. CV_different_sizes_plots # this is basically the same as #5 but uses different plot sizes. 
 9. buffer_and_clip_size

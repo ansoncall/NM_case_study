@@ -370,7 +370,7 @@ fit_local_spatial_rf <- function(train_test_list, test = testing) {
       tmin + tmmx + th + vpdmax + rmax + vs + fm100 + fm1000 + esp + lon + lat,
     data = train_test_list$train,
     spcov_type = "exponential", # this is the default already.
-    local = FALSE, # no spatial approximation!
+    local = list(parallel = TRUE, ncores = detectCores() - 4),
     mtry = 4,
     min.node.size = 2,
     sample.fraction = 0.89
