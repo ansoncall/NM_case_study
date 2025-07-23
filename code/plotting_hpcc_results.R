@@ -146,41 +146,7 @@ plot_grid(effect_hist, scatter_effect, ncol = 1, labels = "auto",
           label_x = 0.96, label_y = 0.95, label_size = 20, align = "v")
 dev.off()
 
-########### Make a map
-# TODO tidy this part
-
-# using veg_treatments_buffer?
-masked_cbi <- mask(masked_cbi, veg_treatments_buffer, inverse=TRUE)
-
-rf_preds <- read.csv("./processed_data/trt_rf_preds.csv")
-
-masked_df <- as.points(masked_cbi)
-
-names(modeled_values_across_hpcc)[1] <- "x"
-names(modeled_values_across_hpcc)[2] <- "y"
-names(modeled_values_across_hpcc)[3] <- "masked_raster"
-masked_df_full<-rbind(masked_df,modeled_values_across_hpcc)
-
-counterfactual_raster<-rasterFromXYZ(masked_df_full)
-
-one_point<-data.frame(lat=-832592.7,lon=1458797)
-one_point<-st_as_sf(one_point,coords=c("lat","lon"),crs=crs(masked_cbi))
-one_region<-st_buffer(one_point,1100)
-cropped_counterfactual_raster<-raster::crop(counterfactual_raster,st_as_sf(one_region))
-
-cropped_actual_raster<-raster::crop(CBI,st_as_sf(one_region))
-
-cropped_veg_treatments<-st_crop(veg_treatments,one_region)
-
-plotting_actual<-rasterToPoints(cropped_actual_raster)
-plotting_counter<-rasterToPoints(cropped_counterfactual_raster)
-
-# what to do:
-
-# identify the treatment specified in the plot
-CBI<-rast("./raw_data/burn_severity/ravg_2022_cbi4.tif")
-point <- data.frame(lat=-832592.7,lon=1458797, id = 1) %>% st_as_sf(coords=c("lon", "lat"), crs=st_crs(CBI))
-mapview::mapview(point) + mapview::mapview(veg_treatments)
+# make map ####
 
 # define bbox of mapped region. should be a little bigger than what's actually
 # mapped. just need points for top left and bottom right corners.
