@@ -1,3 +1,5 @@
+# this script has not been refactored.
+
 library(ggplot2)
 library(dplyr)
 library(sf)
@@ -71,24 +73,24 @@ compare_df$buffer_method<-NA
 
 for (i in 1:50){
   one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
-  
+
   area_of_plot<-st_area(one_plot)/4046.86
-  
+
   buffer_plot<-st_buffer(one_plot,plot_buffer_size)
   area_of_plot_with_buffer<-st_area(buffer_plot)/4046.86
-  
+
   size_of_perimiter<-sqrt(((area_of_plot+area_of_plot_with_buffer)*4046.86)/pi)-sqrt((area_of_plot)*4046.86/pi)
-  
+
   perimiters<-st_buffer(one_plot,size_of_perimiter,allow_holes=TRUE)
   area_perimiter<-st_area(perimiters)/4046.86
-  
+
   perimiter_extract<-raster::extract(masked_cbi,st_as_sf(perimiters),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
   origional_extract<-raster::extract(masked_cbi,st_as_sf(buffer_plot),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-  
+
   perimiter_only<-as.numeric(((perimiter_extract[1]*area_perimiter)-(origional_extract[1]*area_of_plot_with_buffer))/(area_perimiter-area_of_plot_with_buffer))
-  
+
   compare_df[compare_df$plot_id==one_plot$FID_1,"buffer_method"]<-perimiter_only
-  
+
 }
 
 rmse<-sqrt(mean((compare_df$origional_plot_cbi-compare_df$buffer_method)**2,na.rm=TRUE))
@@ -133,19 +135,19 @@ local_spatial_rf<-c()
 for (i in 1:50){
   #for (i in 1:6){
   one_plot<-origional_plots[origional_plots$FID_1==compare_df$plot_id[i],]
-  
+
   size_of_perimiter<-sqrt((size_of_pannel*4046.86)/pi)
-  
+
   one_plot_buffer<-st_buffer(one_plot,size_of_perimiter)
-  
+
   clipped_burn_raster<-raster::crop(CBI,st_as_sf(one_plot_buffer))
   clipped_burn_raster[clipped_burn_raster==0]<-1
   clipped_burn_raster[clipped_burn_raster==9]<-NA
-  
+
   clipped_burn_raster<-raster::mask(clipped_burn_raster,st_buffer(one_plot,size_of_buffer),inverse=TRUE)
-  
+
   training_df<-as.data.frame(rasterToPoints(clipped_burn_raster))
-  
+
   training_df$CBI<-training_df$masked_raster
   training_df$elev<-raster::extract(elev_down,y=training_df[,1:2])
   training_df$aspect<-raster::extract(aspect_down,y=training_df[,1:2])
@@ -154,22 +156,22 @@ for (i in 1:50){
   training_df$slope<-raster::extract(slope_down,y=training_df[,1:2])
   training_df$road_distance<-raster::extract(roads_distance,y=training_df[,1:2])
   training_df$env_potential<-as.factor(raster::extract(site_potential,y=training_df[,1:2]))
-  
+
   training_df<-training_df[complete.cases(training_df),]
-  
+
   training_df<-st_as_sf(training_df,coords=c("x","y"),crs=st_crs(site_potential))
-  
+
   training_df$lat<-as.data.frame(rasterToPoints(clipped_burn_raster))[,1]
   training_df$lon<-as.data.frame(rasterToPoints(clipped_burn_raster))[,2]
-  
-  
+
+
   spatial_rf_model<-splmRF(clipped_burn_raster~elev+aspect+TRI+TPI+slope+road_distance+env_potential+lat+lon,data=training_df,spcov_type = "exponential",local=c(parallel=TRUE,ncores=12),mtry=4,min.node.size=2,sample.fraction=0.89)
-  
+
   #
-  
+
   predict_df<-data.frame(lat=rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,1],
                          lon=rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,2])
-  
+
   predict_df$elev<-raster::extract(elev_down,y=predict_df[,1:2])
   predict_df$aspect<-raster::extract(aspect_down,y=predict_df[,1:2])
   predict_df$TRI<-raster::extract(TRI_down,y=predict_df[,1:2])
@@ -177,26 +179,26 @@ for (i in 1:50){
   predict_df$slope<-raster::extract(slope_down,y=predict_df[,1:2])
   predict_df$road_distance<-raster::extract(roads_distance,y=predict_df[,1:2])
   predict_df$env_potential<-as.factor(raster::extract(site_potential,y=predict_df[,1:2]))
-  
+
   predict_df<-predict_df[complete.cases(predict_df),]
-  
+
   predict_df<-st_as_sf(predict_df,coords=c("lat","lon"),crs=st_crs(site_potential))
-  
+
   predict_df$lat<-rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,1]
   predict_df$lon<-rasterToPoints(raster::crop(site_potential,y=st_as_sf(one_plot)))[,2]
-  
+
   #predict_df$modeled_values<-predict(ranger_rf,data=predict_df,na.rm=TRUE)$predictions
   predict_df$modeled_values<-predict(spatial_rf_model,newdata=predict_df,local=FALSE)
-  
+
   for_conversion<-data.frame(lat=predict_df$lat,lon=predict_df$lon,modeled_values=as.numeric(predict_df$modeled_values))
-  
+
   predict_raster<-rasterFromXYZ(for_conversion,crs=crs(masked_cbi))
-  
+
   mean_cbi<-raster::extract(predict_raster$modeled_values,st_as_sf(one_plot),fun=mean,na.rm=TRUE,weights=TRUE,exact=TRUE,normalizeWeights=TRUE,small=TRUE)
-  
+
   local_spatial_rf[i]<-mean_cbi
-  
-  
+
+
 }
 
 
@@ -220,11 +222,11 @@ spatial_rf_sensitivity<-data.frame()
 
 for (i in 1:nrow(conditions_to_test_2)){
   output<-sensitivity_analyses(conditions_to_test_2$pannel[i],conditions_to_test_2$buffer[i])
-  
+
   spatial_rf_sensitivity<-rbind(spatial_rf_sensitivity,output)
-  
+
   print((i/nrow(conditions_to_test_2))*100)
-  
+
 }
 
 

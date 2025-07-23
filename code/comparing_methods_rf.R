@@ -351,9 +351,8 @@ walk(train_test_each_plot, function(x) {
   }
 })
 
-# Nate: these three plots are in unmappable regions of the CBI map, so we need
-# to drop them. I think these were probably dropped silently in other analyses,
-# but here we need to do it explicitly or the splmRF() call will error out.
+# these three plots are in unmappable regions of the CBI map, so we need to drop
+# them.
 train_test_each_plot[[96]]$validation_FID
 train_test_each_plot[[157]]$validation_FID
 train_test_each_plot[[230]]$validation_FID

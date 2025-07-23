@@ -24,10 +24,8 @@ cbi[cbi == 0] <- 1
 burn_perimeter <- read_sf("./processed_data/burn_perimeter.shp")
 
 ## treatments ####
-# Nate: this should be hpcc_new.shp but was hpcc.shp in the original. Not sure
-# what damage this might have done.
 veg_treatments <- read_sf(
-  "./processed_data/vegetation_treatments_hpcc_new.shp"
+  "./processed_data/vegetation_treatments_hpcc_new.shp" # TODO double check this is the right file
 ) %>%
   # add rownum as first column
   mutate(rownum = row_number(), .before = everything())
@@ -84,14 +82,13 @@ build_train_test <- function(trt_rownum, test = testing) {
   # TODO fix "no visible binding for rownum"
   one_plot <- veg_treatments %>% filter(rownum == trt_rownum)
 
-  # Nate: looks like you had a buffer size of 150 here. Much smaller than what
-  # was used in the compare_methods script. Not sure what to use here.
+  # define buffers
   target_poly <- st_buffer(one_plot, 60)
 
   if (test == TRUE) {
     buffer_size <- 100
   } else {
-    buffer_size <- 200
+    buffer_size <- 800
   }
 
   suppressWarnings( # ignore attribute variable warning
@@ -247,7 +244,6 @@ get_mean_predictions <- function(preds_vec, train_test_one_plot) {
                                                fun = "mean",
                                                weights = "area")
   # final output is the mean cbi value of the validation plot
-  # Nate: could return rasters here as well if we want to map some predictions
   list(id = id,
        mean_predictions = predict_mean)
 }
@@ -274,8 +270,6 @@ write_csv(mean_preds_df, "./processed_data/trt_rf_preds.csv")
 # cluster-based matching ####
 
 # remove the gridded plots that touch off-limits areas
-# Nate: we don't really need to exclude validation plot areas, right? Just
-# excluding the veg treatments here.
 touch_mat <- st_intersects(gridded_plots, veg_treatments, sparse = FALSE)
 non_touching_idx <- which(rowSums(touch_mat) == 0)
 

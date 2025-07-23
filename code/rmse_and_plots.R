@@ -66,7 +66,7 @@ graphing_comparison <- results_df %>%
     lower_ci = ~ quantile(., 0.025),
     upper_ci = ~ quantile(., 0.975)
   ), .names = "{col}__{fn}")) %>%
-  # Nate: this is sort of hacky and the pivoting/string splitting could probably
+  # this is sort of hacky and the pivoting/string splitting could probably
   # be done in a smarter way, but it works.
   pivot_longer(everything(),
                names_to = c("model_type", ".value"),
@@ -143,7 +143,6 @@ make_plot <- function(xvar, xname) {
     theme_classic() +
     ylab("Validaiton plot burn severity (CBI)") +
     xlab(xname) +
-    # Nate: can avoid using separate lm() call with stat_poly_eq
     stat_poly_eq(use_label("eq"),
                  label.y = 0.15,
                  label.x = 0.85,

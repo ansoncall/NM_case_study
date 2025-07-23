@@ -201,9 +201,6 @@ krig_plot <- function(validation_plot_id) {
   # one_plot <- validation_plots %>% filter(FID_1 == 18) # for testing # nolint
   # TODO fix "no visible binding"
   one_plot <- validation_plots %>% filter(FID_1 == validation_plot_id) # nolint
-  # Nate, this was the original size. Could change or leave it, just make sure
-  # its documented in the paper correctly. Hardcoding for speed here.
-  # size_of_neighborhood <- sqrt((200*4046.86)/pi) # nolint
   if (testing == TRUE) {
     # for testing, use a smaller neighborhood. this runs in ~10 minutes.
     buffer_size <- 200
@@ -233,10 +230,6 @@ krig_plot <- function(validation_plot_id) {
     }
   }
 
-  # Nate: it also fails when all non-NA cells have the same value, which can
-  # happen easily when the neighborhood size is small. here, we check to see if
-  # that is the case, and if so we skip over kriging and just assign that
-  # singular value as the prediction.
   vals <- values(clipped_burn_raster, mat = FALSE)
   vals <- vals[!is.na(vals)]
   all_same <- length(unique(vals)) == 1
@@ -308,15 +301,6 @@ gridded_plots_clean <- gridded_plots[non_touching_idx, ] %>%
   mutate(across(c(elev, ppt, vs),
                 ~ (. - mean(.)) / sd(.),
                 .names = "{col}_norm"))
-# Nate: validation and control plots contain (obviously) the validation plots,
-# but also the practitioner-generated control plots. There's no need to make
-# these areas off-limits here. In fact, this could be one of the reasons this
-# method underperforms: the best gridded plots, based on PSM, are likely going
-# to be near the practitioner-selected control. I know a lot has changed in this
-# script, but I am pretty sure this error is present in the original and not
-# introduced by me.
-# mapview::mapview(gridded_plots_clean) +
-#   mapview::mapview(off_limits, color = "red", alpha = 0.5) # nolint
 
 # find nearest neighbors
 nearest_model <- knnreg(cbi ~ elev_norm + ppt_norm + vs_norm,
