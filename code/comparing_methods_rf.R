@@ -40,10 +40,6 @@ validation_plots <- read_sf(
   filter(as.integer(ID) < 352) %>%
   st_transform(crs = crs(cbi))
 
-## HPCC burn perimeter ####
-# TODO unused? remove?
-burn_perimiter <- read_sf("./processed_data/burn_perimiter.shp")
-
 ## treatments ####
 veg_treatments <- read_sf("./processed_data/vegetation_treatments_hpcc_new.shp")
 
@@ -223,22 +219,7 @@ spatial_rf_model <- splmRF(
   min.node.size = 2,
   sample.fraction = 0.89
 )
-# some notes from output:
 
-# var_adjust was not specified and the sample size exceeds 100,000, so the
-# default var_adjust value is being changed from "theoretical" to "none". To
-# override this behavior, rerun and set var_adjust in local. Be aware that
-# setting var_adjust to "theoretical" may result in exceedingly long
-# computational times.
-
-# Warning messages:
-# 1: Quick-TRANSfer stage steps exceeded maximum (= 67794200)
-# 2: In UseMethod("depth") :
-#   no applicable method for 'depth' applied to an object of class "NULL"
-# 3: In UseMethod("depth") :
-#   no applicable method for 'depth' applied to an object of class "NULL"
-
-# TODO: look into this, make sure it's not too problematic.
 spatial_rf_model
 
 ## extract global predictions ####

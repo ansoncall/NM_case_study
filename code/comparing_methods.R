@@ -276,16 +276,6 @@ compare <- left_join(compare,
   rename(cbi_krigged = cbi_krig)
 
 # cluster based matching ####
-# TODO ppt was missing from gridded plots. Could fix this in weather_and_knn
-# script. Just adding it here for now.
-names(gridded_plots)
-gridded_plots$ppt <- exact_extract(
-  rasts$ppt,
-  gridded_plots,
-  fun = "mean",
-  weights = "area",
-  progress = TRUE
-)
 # define off-limits areas: treated areas and validation plots
 off_limits <- rbind(st_as_sf(st_geometry(veg_treatments),
                              crs = st_crs(validation_plots)),

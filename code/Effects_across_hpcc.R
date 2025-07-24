@@ -25,7 +25,7 @@ burn_perimeter <- read_sf("./processed_data/burn_perimeter.shp")
 
 ## treatments ####
 veg_treatments <- read_sf(
-  "./processed_data/vegetation_treatments_hpcc_new.shp" # TODO double check this is the right file
+  "./processed_data/vegetation_treatments_hpcc_new.shp"
 ) %>%
   # add rownum as first column
   mutate(rownum = row_number(), .before = everything())
@@ -63,16 +63,6 @@ names(rasts) <- raster_varnames
 # rename and combine other raster layers
 rasts <- c(rasts, site_potential, cbi)
 
-# TODO ppt was missing from gridded plots. Could fix this in weather_and_knn
-# script. Just adding it here for now.
-names(gridded_plots)
-gridded_plots$ppt <- exact_extract(
-  rasts$ppt,
-  gridded_plots,
-  fun = "mean",
-  weights = "area",
-  progress = TRUE
-)
 # local spatial random forest ####
 # this includes "local spatial" rf models with and without weather variables.
 
@@ -317,9 +307,3 @@ veg_treatments$knn_pred <- predict(nearest_model, veg_treatments)
 # method cbi predictions as attribute data.
 st_write(veg_treatments, dsn = "./results/hpcc_processed_cbi_new.shp",
          append = FALSE)
-
-# TODO update mean_preds dataframe and write out csv predictions. file now to
-# include cluster-based matching method cbi predictions in addition to the
-# previously-generated rf-based predictions.
-# mean_preds_df
-# write_csv(meat_preds_df, "./processed_data/trt_rf_preds.csv") # nolint

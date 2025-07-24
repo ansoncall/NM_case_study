@@ -95,8 +95,6 @@ lf_site_potential <-
   rast("./raw_data/landfire_environmental_site_potential/Tif/us_140esp.tif") %>%
   project(cbi, method = "near")
 
-# TODO check downstream code to make sure factor levels are correct
-
 ## climate ####
 clim_vars <- c("tmin", "vpdmax", "ppt")
 for (i in seq_along(clim_vars)) {

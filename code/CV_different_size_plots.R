@@ -70,17 +70,6 @@ names(rasts) <- raster_varnames
 # rename and combine other raster layers
 rasts <- c(rasts, site_potential, cbi)
 
-# TODO ppt was missing from gridded plots. Could fix this in weather_and_knn
-# script. Just adding it here for now.
-names(gridded_plots)
-gridded_plots$ppt <- exact_extract(
-  rasts$ppt,
-  gridded_plots,
-  fun = "mean",
-  weights = "area",
-  progress = TRUE
-)
-
 # wrangle ####
 # calculate buffer size for making plots of various acreages
 plot_sizes <- data.frame(acres = c(2, 5, 15, 50, 100, 150, 250))
@@ -217,8 +206,9 @@ all_preds <- purrr::map(train_test_data, fit_local_spatial_rf, .progress = TRUE)
 get_mean_predictions <- function(preds_vec, id) {
   # get id. just a number from seq_along(train_test_data)
   train_test_one_plot <- train_test_data[[id]]
-  # get preds vec id. #TODO rename build_train_test output so its no longer
-  # "validation_FID" since we're not working with validation plots here.
+  # get preds vec id.
+  # TODO rename build_train_test output so its no longer "validation_FID" since
+  # we're not working with validation plots here.
   p_id <- preds_vec$validation_FID
   # check that the id matches
   if (id != p_id) {
@@ -372,11 +362,8 @@ mean_preds_df <- krig_results %>%
   cbind(mean_preds_df, .)
 
 # simple perimeters ####
-# TODO
-
-# perimeter area will be equal to the plot area.
-
-# calculate correct outer radius depending on plot size
+# perimeter area will be equal to the plot area. calculate correct outer radius
+# depending on plot size
 plot_sizes_with_perimeters <- plot_sizes %>%
   mutate(
     # get plot area in m
