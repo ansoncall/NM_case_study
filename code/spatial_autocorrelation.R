@@ -1,7 +1,6 @@
 library(gstat)
 library(sf)
 library(raster)
-
 library(dplyr)
 library(spdep)
 library(ggplot2)
